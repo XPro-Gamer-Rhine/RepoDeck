@@ -1,0 +1,22 @@
+{
+  "name": "repodeck-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "RepoDeck engine — git sync, AI codebase analysis, architecture graph, knowledge-graph export and local deploy supervision. Driven by the macOS app over JSON-RPC/NDJSON on stdio.",
+  "main": "index.js",
+  "bin": { "repodeck-engine": "index.js" },
+  "scripts": {
+    "start": "node index.js daemon",
+    "check": "node -e \"require('./lib/daemon');require('./lib/db');console.log('engine ok')\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.0",
+    "node-cron": "^3.0.3",
+    "openai": "^4.77.0",
+    "simple-git": "^3.27.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
+  "engines": { "node": ">=22.5" }
+}

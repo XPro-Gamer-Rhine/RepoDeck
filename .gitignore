@@ -1,0 +1,7 @@
+.DS_Store
+dist/
+node_modules/
+macos/.build/
+macos/Generated/
+macos/RepoDeck.xcodeproj/
+*.xcuserdatad

@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RepoDeck — keep every repo current, understood, and running</title>
+<meta name="description" content="A native macOS app that watches your repositories: pulls on a schedule or when a PR merges, redeploys locally, and builds a knowledge graph your Claude agents can read.">
+<meta property="og:title" content="RepoDeck">
+<meta property="og:description" content="Keep every repository current, understood, and running — and hand your Claude agents a knowledge graph of it.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='30' r='11' fill='%23e0555f'/><circle cx='26' cy='68' r='9' fill='%2338b6c8'/><circle cx='74' cy='68' r='9' fill='%23f0a63c'/><circle cx='50' cy='52' r='13' fill='%23a06ee0'/></svg>">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --bg-soft: #f6f7f9;
+    --bg-card: #ffffff;
+    --fg: #14161a;
+    --fg-muted: #5a6169;
+    --fg-faint: #868d96;
+    --line: #e3e6ea;
+    --accent: #5b6ef5;
+    --accent-soft: #eef0fe;
+    --code-bg: #f2f3f6;
+    --route: #d8434f;
+    --service: #1f9bb0;
+    --engine: #e08a2a;
+    --model: #d2a516;
+    --job: #34a853;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(20, 22, 26, .06), 0 8px 28px rgba(20, 22, 26, .07);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d0f13;
+      --bg-soft: #12151b;
+      --bg-card: #161a21;
+      --fg: #eef1f5;
+      --fg-muted: #a3abb6;
+      --fg-faint: #737c88;
+      --line: #242a33;
+      --accent: #8a97ff;
+      --accent-soft: #1a1f36;
+      --code-bg: #10131a;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 34px rgba(0,0,0,.45);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; }
+
+  /* ── header ─────────────────────────────────────────────────────────── */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(160%) blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+  header .wrap { display: flex; align-items: center; gap: 20px; height: 60px; }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -.01em; }
+  .logo svg { display: block; }
+  nav { margin-left: auto; display: flex; gap: 22px; align-items: center; font-size: 14.5px; }
+  nav a { color: var(--fg-muted); }
+  nav a:hover { color: var(--fg); text-decoration: none; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--accent); color: #fff; border: 1px solid transparent;
+    padding: 9px 16px; border-radius: 9px; font-weight: 550; font-size: 14.5px;
+  }
+  .btn:hover { text-decoration: none; filter: brightness(1.07); }
+  .btn.ghost { background: transparent; color: var(--fg); border-color: var(--line); }
+  @media (max-width: 720px) { nav .hide-sm { display: none; } }
+
+  /* ── hero ───────────────────────────────────────────────────────────── */
+  .hero { padding: 84px 0 56px; text-align: center; }
+  .eyebrow {
+    display: inline-block; font-size: 13px; font-weight: 550; letter-spacing: .02em;
+    color: var(--accent); background: var(--accent-soft);
+    padding: 5px 12px; border-radius: 999px; margin-bottom: 22px;
+  }
+  h1 {
+    font-size: clamp(34px, 5.6vw, 58px); line-height: 1.08;
+    letter-spacing: -.028em; margin: 0 0 20px; font-weight: 680;
+  }
+  .lede { font-size: clamp(17px, 2.1vw, 20px); color: var(--fg-muted); max-width: 680px; margin: 0 auto 32px; }
+  .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .req { margin-top: 18px; font-size: 13.5px; color: var(--fg-faint); }
+
+  /* ── install ────────────────────────────────────────────────────────── */
+  .install { max-width: 780px; margin: 40px auto 0; text-align: left; }
+  .cmd {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--code-bg); border: 1px solid var(--line);
+    border-radius: 11px; padding: 14px 16px; font-size: 13.5px; overflow-x: auto;
+  }
+  .cmd code { white-space: nowrap; color: var(--fg); }
+  .cmd .prompt { color: var(--fg-faint); user-select: none; }
+  .copy {
+    margin-left: auto; flex: none; cursor: pointer; border: 1px solid var(--line);
+    background: var(--bg-card); color: var(--fg-muted); border-radius: 7px;
+    padding: 5px 11px; font-size: 12.5px; font-family: inherit;
+  }
+  .copy:hover { color: var(--fg); }
+
+  /* ── sections ───────────────────────────────────────────────────────── */
+  section { padding: 72px 0; border-top: 1px solid var(--line); }
+  section h2 { font-size: clamp(25px, 3.4vw, 34px); letter-spacing: -.022em; margin: 0 0 12px; font-weight: 660; }
+  section .sub { color: var(--fg-muted); max-width: 680px; margin: 0 0 40px; font-size: 17px; }
+
+  .grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 24px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 17.5px; font-weight: 620; letter-spacing: -.01em; }
+  .card p { margin: 0; color: var(--fg-muted); font-size: 15px; }
+  .card .ico { font-size: 20px; margin-bottom: 12px; display: block; }
+
+  figure { margin: 0 0 20px; }
+  figure img {
+    width: 100%; display: block; border-radius: var(--radius);
+    border: 1px solid var(--line); box-shadow: var(--shadow); background: var(--bg-soft);
+  }
+  figcaption { margin-top: 12px; font-size: 14.5px; color: var(--fg-muted); }
+
+  .shots { display: grid; gap: 28px; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 860px) { .shots { grid-template-columns: 1fr; } }
+
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--fg); width: 210px; }
+  td { color: var(--fg-muted); }
+  tr:last-child th, tr:last-child td { border-bottom: none; }
+
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 11px;
+    padding: 18px; overflow-x: auto; font-size: 13px; line-height: 1.6; margin: 0;
+  }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 18px; font-size: 13.5px; color: var(--fg-muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+  .steps { counter-reset: step; display: grid; gap: 18px; }
+  .step { display: flex; gap: 16px; align-items: flex-start; }
+  .step .n {
+    counter-increment: step; flex: none;
+    width: 28px; height: 28px; border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent);
+    display: grid; place-items: center; font-size: 13.5px; font-weight: 650;
+  }
+  .step .n::before { content: counter(step); }
+  .step h4 { margin: 2px 0 4px; font-size: 16px; font-weight: 600; }
+  .step p { margin: 0; color: var(--fg-muted); font-size: 15px; }
+
+  .note {
+    border-left: 3px solid var(--accent); background: var(--accent-soft);
+    padding: 16px 20px; border-radius: 0 10px 10px 0; font-size: 15px; color: var(--fg-muted);
+  }
+  .note strong { color: var(--fg); }
+
+  footer { border-top: 1px solid var(--line); padding: 40px 0 64px; color: var(--fg-faint); font-size: 14px; }
+  footer .wrap { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; }
+  footer nav { margin-left: auto; gap: 20px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="logo">
+      <svg width="22" height="22" viewBox="0 0 100 100" aria-hidden="true">
+        <line x1="50" y1="30" x2="50" y2="52" stroke="currentColor" stroke-width="3" opacity=".35"/>
+        <line x1="26" y1="68" x2="50" y2="52" stroke="currentColor" stroke-width="3" opacity=".35"/>
+        <line x1="74" y1="68" x2="50" y2="52" stroke="currentColor" stroke-width="3" opacity=".35"/>
+        <circle cx="50" cy="30" r="11" fill="#e0555f"/>
+        <circle cx="26" cy="68" r="9" fill="#38b6c8"/>
+        <circle cx="74" cy="68" r="9" fill="#f0a63c"/>
+        <circle cx="50" cy="52" r="13" fill="#a06ee0"/>
+      </svg>
+      RepoDeck
+    </span>
+    <nav>
+      <a href="#what" class="hide-sm">What it does</a>
+      <a href="#graph" class="hide-sm">The graph</a>
+      <a href="#agents" class="hide-sm">For agents</a>
+      <a href="#install">Install</a>
+      <a class="btn ghost" href="https://github.com/XPro-Gamer-Rhine/RepoDeck">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap hero">
+  <span class="eyebrow">Native macOS · open source</span>
+  <h1>Keep every repository current,<br>understood, and running.</h1>
+  <p class="lede">
+    RepoDeck watches the repos your team works on. It pulls on a schedule or within
+    the hour a pull request merges, resolves the merge, redeploys your app locally,
+    and keeps a knowledge graph of the codebase that your Claude agents can read.
+  </p>
+  <div class="cta">
+    <a class="btn" href="#install">Install</a>
+    <a class="btn ghost" href="https://github.com/XPro-Gamer-Rhine/RepoDeck">Source on GitHub</a>
+  </div>
+  <p class="req">macOS 14+ · Node.js 22.5+ · free and open source</p>
+
+  <div class="install">
+    <div class="cmd">
+      <span class="prompt">$</span>
+      <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/XPro-Gamer-Rhine/RepoDeck/main/install.sh | bash</code>
+      <button class="copy" onclick="copyInstall(this)">Copy</button>
+    </div>
+  </div>
+</div>
+
+<section id="what">
+  <div class="wrap">
+    <h2>Three jobs, one app</h2>
+    <p class="sub">
+      Most of what a team loses to repository drift is attention: noticing a merge landed,
+      remembering to pull, working out what changed, restarting the thing that broke.
+      RepoDeck takes all four.
+    </p>
+    <div class="grid">
+      <div class="card">
+        <span class="ico">🔄</span>
+        <h3>It stays current on its own</h3>
+        <p>
+          Per-repo schedules in your timezone, plus a watcher that asks GitHub each hour
+          whether a pull request merged. Every pull fetches first. The clone is treated
+          as a mirror, so a reset cannot lose work — and the moment it <em>does</em> hold
+          local commits, RepoDeck upgrades to a real merge instead of discarding them.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">📦</span>
+        <h3>It redeploys your app</h3>
+        <p>
+          RepoDeck works out how your repo starts — npm scripts, Docker Compose, Procfile,
+          Makefile, <code>manage.py</code>, <code>artisan</code>, Go, Cargo — and shows you the exact
+          commands before running anything. After that, a merge on the default branch restarts
+          the process on the new code, reinstalling only when a lock file actually moved.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">🧠</span>
+        <h3>It writes the brief your agents need</h3>
+        <p>
+          Not a summary — a knowledge graph. Traced request paths, function contracts,
+          an error catalogue, and debugging playbooks keyed by symptom. Export it and
+          point a Claude Code subagent at it.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="landed">
+  <div class="wrap">
+    <h2>Know what landed without reading a diff</h2>
+    <p class="sub">
+      Every merge gets a digest written from its commits <em>and</em> its diff — not from
+      the commit subjects. What changed, what is new, what got fixed, what breaks, and the
+      two or three files actually worth opening.
+    </p>
+    <pre>Response rendering now accepts caller-supplied payload fields          <span style="color:var(--engine)">medium risk</span>
+
+The render helper now takes an optional extra object and merges its fields
+into the JSON response alongside ok and version. It validates that extra is
+an object when provided, so invalid callers get an explicit error.
+
+NEW        Callers can pass an optional object to render(version, extra)
+<span style="color:var(--route)">BREAKING   Extra fields are spread after the default { ok, version } payload,
+           so callers can override ok or version by passing those keys</span>
+OPEN       render.js · version.json</pre>
+    <p class="sub" style="margin-top:20px;margin-bottom:0">
+      That breaking change is not in any commit message. It was read out of the diff.
+    </p>
+  </div>
+</section>
+
+<section id="graph">
+  <div class="wrap">
+    <h2>See how the code actually connects</h2>
+    <p class="sub">
+      Two things are encoded at once. <strong>Hue is what a node is</strong> — routes red,
+      services cyan, engines orange, models yellow, jobs green. <strong>Brightness and glow
+      are how often it changes</strong>, from time-decayed merge churn, so the parts of the
+      codebase currently in motion light up.
+    </p>
+
+    <div class="shots">
+      <figure>
+        <img src="assets/graph-3d.png" alt="A three-dimensional force-directed graph of a codebase, with nearer nodes larger and brighter">
+        <figcaption><strong>3D.</strong> The same physics with a third axis — drag to orbit. Depth is carried by size and brightness, so a dense graph stops overlapping itself.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/graph-flow.png" alt="A layered flow diagram showing components, routes, services and jobs in left-to-right columns">
+        <figcaption><strong>Flow.</strong> Columns left to right: screen → route → middleware → controller → service → model. Ordered within each column to minimise crossings.</figcaption>
+      </figure>
+    </div>
+
+    <figure>
+      <img src="assets/graph-force.png" alt="A force-directed graph with directed arrows between files">
+      <figcaption>
+        <strong>Force.</strong> Every edge is directed, curved so a mutual pair reads as two arcs
+        rather than one line drawn twice. Hover a node and everything outside its neighbourhood
+        blurs out.
+      </figcaption>
+    </figure>
+
+    <div class="legend">
+      <span><i class="dot" style="background:var(--route)"></i> routes &amp; handlers</span>
+      <span><i class="dot" style="background:var(--service)"></i> services</span>
+      <span><i class="dot" style="background:var(--engine)"></i> engines</span>
+      <span><i class="dot" style="background:var(--model)"></i> models</span>
+      <span><i class="dot" style="background:var(--job)"></i> jobs</span>
+    </div>
+
+    <p class="sub" style="margin-top:34px;margin-bottom:0">
+      Pick what one dot means: every file, folders, feature modules, or <strong>functions</strong> —
+      the view that answers “where does <code>POST /repos</code> actually go?”. In the function
+      view a node is a handler, function, class or component, and an edge is a call, with the
+      line it happens on.
+    </p>
+  </div>
+</section>
+
+<section id="agents">
+  <div class="wrap">
+    <h2>A knowledge graph, not a summary</h2>
+    <p class="sub">
+      Built during indexing and refreshed on every pull. Half of it is <em>derived</em> —
+      traced out of the call graph and the source, so every <code>path:line</code> is checkable.
+      Only the prose is written by a model, and it is written against that derived material.
+    </p>
+
+    <table>
+      <tr><th>flows.md</th><td>Where a request goes, hop by hop. Every step is a real call on a real line.</td></tr>
+      <tr><th>playbooks.md</th><td>Symptom → likely cause → which files to open in which order → what a correct fix looks like → how to verify it.</td></tr>
+      <tr><th>functions.md</th><td>Per function: purpose, return shape, what it changes outside itself, how it fails, what it assumes.</td></tr>
+      <tr><th>errors.md</th><td>Every failure the code can raise, the line that raises it, and what to check when you see it.</td></tr>
+      <tr><th>api-surface.md</th><td>Every endpoint, its handler, its middleware chain, the payload it expects, the shape it returns.</td></tr>
+      <tr><th>agents/&lt;module&gt;.md</th><td>A drop-in Claude Code subagent per feature area, carrying that module’s flows, contracts, errors and invariants.</td></tr>
+      <tr><th>call-graph.json</th><td>Every function and every call between them, machine-readable, with line numbers.</td></tr>
+    </table>
+
+    <figure style="margin-top:36px">
+      <img src="assets/knowledge.png" alt="The knowledge tab showing an extracted architecture description">
+      <figcaption>The same material is browsable in the app, which is the fastest way to check the model got your repository right before you hand the bundle to an agent.</figcaption>
+    </figure>
+
+    <div class="note" style="margin-top:12px">
+      <strong>Why this and not a README?</strong> An agent asked to fix a bug starts from a symptom —
+      an error string, a failing test, a wrong response. None of those are searchable in a document
+      that only describes architecture. The playbooks and the error catalogue exist so that the
+      first thing an agent does is land on the right file.
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="sub">Two ways in. The one-liner is recommended — it also handles the quarantine flag for you.</p>
+
+    <h3 style="font-size:18px;margin:0 0 12px">One command</h3>
+    <div class="cmd" style="margin-bottom:14px">
+      <span class="prompt">$</span>
+      <code>curl -fsSL https://raw.githubusercontent.com/XPro-Gamer-Rhine/RepoDeck/main/install.sh | bash</code>
+      <button class="copy" onclick="copyInstall(this)">Copy</button>
+    </div>
+    <p class="sub">
+      Builds from source, installs to <code>/Applications</code>, clears the quarantine flag, and launches.
+      Re-run any time to update.
+    </p>
+
+    <h3 style="font-size:18px;margin:28px 0 12px">Or download the DMG</h3>
+    <p class="sub" style="margin-bottom:14px">
+      Drag RepoDeck across, then double-click <strong>Remove quarantine.command</strong> once.
+    </p>
+    <p><a class="btn ghost" href="https://github.com/XPro-Gamer-Rhine/RepoDeck/releases/latest">Download RepoDeck.dmg</a></p>
+
+    <div class="note" style="margin-top:28px">
+      <strong>RepoDeck is not notarized.</strong> Notarization means sending every build to Apple
+      for approval, which needs a paid Developer ID. The app is signed locally instead, which macOS
+      accepts — but it still flags anything downloaded from the internet until that flag is cleared.
+      The installer does it for you; the DMG ships a one-click script that does the same. If you would
+      rather do it by hand:
+      <pre style="margin-top:12px">xattr -dr com.apple.quarantine /Applications/RepoDeck.app</pre>
+    </div>
+
+    <h3 style="font-size:18px;margin:36px 0 16px">Then</h3>
+    <div class="steps">
+      <div class="step">
+        <span class="n"></span>
+        <div>
+          <h4>Connect GitHub</h4>
+          <p>Three ways in: borrow the token from a <code>gh auth login</code> that already happened on
+          this Mac, sign in on github.com with a device code, or paste a personal access token.
+          Tokens go in the macOS Keychain — RepoDeck’s database stores only a reference to them.</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n"></span>
+        <div>
+          <h4>Add a model</h4>
+          <p>A Claude or OpenAI key, or point it at a local endpoint — Ollama, LM Studio, vLLM,
+          anything that speaks the OpenAI API. Each repo can use a different one. Without a model
+          you still get the file graph, real import edges, clusters and the heatmap.</p>
+        </div>
+      </div>
+      <div class="step">
+        <span class="n"></span>
+        <div>
+          <h4>Paste a repo URL</h4>
+          <p>SSH or HTTPS, or pick one from your account. RepoDeck reads the remote first, so the
+          branch picker has real data in it before anything is cloned.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <h2>How it works</h2>
+    <p class="sub">
+      A SwiftUI app and a Node engine, talking JSON-RPC over stdio. The engine owns the cron
+      tasks, the pull-request watchers and the dev servers RepoDeck supervises — all of which
+      have to outlive any one screen.
+    </p>
+    <pre>┌──────────────── RepoDeck.app ────────────────┐
+│  SwiftUI window  ·  menubar status           │
+│  native Canvas graph, 2D and 3D              │
+└───────────────┬──────────────────────────────┘
+                │  JSON-RPC / NDJSON over stdio
+┌───────────────▼──────────────────────────────┐
+│  node engine · one process, many repos       │
+│  git · GitHub · scan+resolve · call graph    │
+│  Louvain · heat · knowledge graph · deploy   │
+│  per-repo cron + pull-request watchers       │
+└──────────────────────────────────────────────┘</pre>
+
+    <h3 style="font-size:18px;margin:32px 0 12px">The safety model</h3>
+    <table>
+      <tr><th>Credentials</th><td>Live in the macOS Keychain and reach the engine over its stdin pipe. Never in the database, never on a command line — a copy of the sqlite file is worthless.</td></tr>
+      <tr><th>Destructive pulls</th><td>A reset only ever runs on a tree RepoDeck itself filled. Local work upgrades the pull to a merge automatically.</td></tr>
+      <tr><th>Running your code</th><td>Nothing executes until you have seen the exact command. Deploy profiles are proposed, printed, then approved.</td></tr>
+      <tr><th>Graph edges</th><td>Model-inferred edges must quote a line from the source, and the quote is checked against the file before the edge is kept.</td></tr>
+    </table>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>RepoDeck — free and open source.</span>
+    <nav>
+      <a href="https://github.com/XPro-Gamer-Rhine/RepoDeck">GitHub</a>
+      <a href="https://github.com/XPro-Gamer-Rhine/RepoDeck/releases">Releases</a>
+      <a href="https://github.com/XPro-Gamer-Rhine/RepoDeck/issues">Issues</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+  function copyInstall(button) {
+    const text = document.getElementById('install-cmd').textContent.trim();
+    navigator.clipboard.writeText(text).then(function () {
+      const original = button.textContent;
+      button.textContent = 'Copied';
+      setTimeout(function () { button.textContent = original; }, 1600);
+    });
+  }
+</script>
+
+</body>
+</html>

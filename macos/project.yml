@@ -1,0 +1,48 @@
+name: RepoDeck
+options:
+  bundleIdPrefix: com.repodeck
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+targets:
+  RepoDeck:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/RepoDeck
+      - path: AppIcon.icns
+        buildPhase: resources
+        optional: true
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleName: RepoDeck
+        CFBundleDisplayName: RepoDeck
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        CFBundleIconFile: AppIcon
+        LSMinimumSystemVersion: "14.0"
+        # Main window in the Dock, plus a menubar item for sync status.
+        LSUIElement: false
+    settings:
+      base:
+        PRODUCT_NAME: "RepoDeck"
+        PRODUCT_BUNDLE_IDENTIFIER: com.repodeck.app
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Automatic
+        # A developer tool: it spawns `node`, runs `git`, starts the user's own
+        # dev servers and reaches any git host they configure. None of that
+        # survives the sandbox.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+    postBuildScripts:
+      - name: Bundle engine
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          DEST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/engine"
+          mkdir -p "$DEST"
+          rsync -a --delete --exclude '.git' "$SRCROOT/../engine/" "$DEST/"
