@@ -2,7 +2,7 @@
 #
 # One-line installer for RepoDeck.
 #
-#   curl -fsSL https://raw.githubusercontent.com/<you>/RepoDeck/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/XPro-Gamer-Rhine/RepoDeck/main/install.sh | bash
 #
 # Clones (or updates) the repository into ~/.repodeck/src, builds the app from
 # source, installs it to /Applications, and launches it. Re-run to update.
@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO_URL="${REPODECK_REPO:-https://github.com/XPro-Gamer-Rhine/RepoDeck.git}"
 SRC="${REPODECK_SRC:-$HOME/.repodeck/src}"
-DEST="/Applications/RepoDeck.app"
+DEST="${REPODECK_DEST:-/Applications/RepoDeck.app}"
 
 say()  { printf '\033[1;36m▶\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m⚠\033[0m %s\n' "$1"; }
@@ -28,21 +28,37 @@ xcode-select -p >/dev/null 2>&1 || die "Xcode Command Line Tools are missing. Ru
 
 command -v swift >/dev/null 2>&1 || die "Swift is missing. Run: xcode-select --install"
 
+# Prefer a Node that can actually run the engine, not just the first one on the
+# list. A machine with Homebrew's current Node alongside an older nvm build is
+# completely ordinary, and picking the old one leaves the engine unable to open
+# its database.
+node_has_sqlite() {
+  local v major minor
+  v="$("$1" -v 2>/dev/null)" || return 1
+  v="${v#v}"; major="${v%%.*}"; v="${v#*.}"; minor="${v%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major > 22 )) || { (( major == 22 )) && (( minor >= 5 )); }
+}
+
 find_node() {
-  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
-    [[ -x "$candidate" ]] && { echo "$candidate"; return; }
+  local fallback=""
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node "$(command -v node || true)"; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    node_has_sqlite "$candidate" && { echo "$candidate"; return; }
+    [[ -z "$fallback" ]] && fallback="$candidate"
   done
-  command -v node || true
+  echo "$fallback"
 }
 
 NODE_BIN="$(find_node)"
 [[ -n "$NODE_BIN" ]] || die "Node.js is missing. Run: brew install node"
 
 NODE_VERSION="$("$NODE_BIN" -v)"
-NODE_MAJOR="$(echo "${NODE_VERSION#v}" | cut -d. -f1)"
-NODE_MINOR="$(echo "${NODE_VERSION#v}" | cut -d. -f2)"
-if (( NODE_MAJOR < 22 )) || { (( NODE_MAJOR == 22 )) && (( NODE_MINOR < 5 )); }; then
-  warn "Node ${NODE_VERSION} has no built-in SQLite. RepoDeck wants 22.5 or newer — brew install node"
+if ! node_has_sqlite "$NODE_BIN"; then
+  # Not a warning any more. RepoDeck stores everything through Node's built-in
+  # SQLite, which arrived in 22.5, and nothing compiled ships with the app — so
+  # on an older runtime the engine cannot start at all.
+  die "Node ${NODE_VERSION} is too old — RepoDeck needs 22.5 or newer. Run: brew install node"
 fi
 
 say "Node ${NODE_VERSION} at ${NODE_BIN}"
