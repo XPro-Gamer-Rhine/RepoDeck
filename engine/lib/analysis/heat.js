@@ -27,7 +27,12 @@ function recomputeHeat(repoId) {
 
   const agg = new Map();
   for (const r of rows) {
-    const ageDays = Math.max(0, (now - Date.parse(r.committed_at)) / 86_400_000);
+    const committedAt = Date.parse(r.committed_at);
+    // Date.parse returns NaN for anything it cannot read, and NaN propagates
+    // through the decay into every file's heat — which then goes into a REAL
+    // NOT NULL column as null-ish garbage. Treat an unreadable timestamp as old.
+    if (!Number.isFinite(committedAt)) continue;
+    const ageDays = Math.max(0, (now - committedAt) / 86_400_000);
     const weight = Math.exp(-lambda * ageDays);
     const cur = agg.get(r.path) || { raw: 0, count: 0, last: r.committed_at };
     cur.raw += (1 + Math.log1p(r.size)) * weight;
@@ -36,7 +41,12 @@ function recomputeHeat(repoId) {
     agg.set(r.path, cur);
   }
 
-  const max = Math.max(...[...agg.values()].map((v) => v.raw), 0.000001);
+  // A fold, not a spread. Math.max(...array) passes every element as an argument
+  // and throws RangeError past roughly 130k of them — and `agg` is keyed by every
+  // path the repository's merge history has ever touched, which a long-lived
+  // monorepo clears easily.
+  let max = 0.000001;
+  for (const v of agg.values()) if (v.raw > max) max = v.raw;
 
   const churnByPath = db
     .prepare(

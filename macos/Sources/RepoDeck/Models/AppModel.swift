@@ -58,6 +58,19 @@ final class AppModel: ObservableObject {
         engine.onEvent = { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
+        // A restarted engine is a blank one: it has no credentials and no running
+        // schedules until we hand them back.
+        engine.onRestart = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.banner = Banner(
+                    level: .warning,
+                    title: "The engine restarted",
+                    detail: "Schedules and credentials have been restored. Anything it was running was stopped."
+                )
+                await self.pushSecrets()
+            }
+        }
         engine.start()
 
         if let error = engine.startupError {

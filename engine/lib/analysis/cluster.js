@@ -119,16 +119,23 @@ function detectCommunities(repoId) {
   }
 
   let g = buildGraph(rawEdges, nodes);
-  let mapping = localMoving(g);
+
+  // Two mappings, deliberately. `levelMapping` is about the CURRENT graph, whose
+  // nodes are communities after the first aggregation; `mapping` is about the
+  // original files. Using one map for both meant the second level looked up
+  // community ids in a file-keyed map — and since both are integers it silently
+  // matched unrelated entries instead of failing, mis-attributing the edges.
+  let levelMapping = localMoving(g);
+  let mapping = new Map(levelMapping);
 
   for (let level = 0; level < 2; level++) {
-    const comms = [...new Set(mapping.values())];
+    const comms = [...new Set(levelMapping.values())];
     if (comms.length <= 1 || comms.length === g.nodes.length) break;
 
     const aggEdges = new Map();
     for (const { a, b, w } of rawEdgesOf(g)) {
-      const ca = mapping.get(a);
-      const cb = mapping.get(b);
+      const ca = levelMapping.get(a);
+      const cb = levelMapping.get(b);
       if (ca == null || cb == null) continue;
       const key = ca < cb ? `${ca}|${cb}` : `${cb}|${ca}`;
       const cur = aggEdges.get(key) || { a: ca, b: cb, w: 0 };
@@ -138,10 +145,13 @@ function detectCommunities(repoId) {
 
     const superGraph = buildGraph([...aggEdges.values()], comms);
     const superMapping = localMoving(superGraph);
+
     const next = new Map();
-    for (const [n, c] of mapping) next.set(n, superMapping.get(c) ?? c);
+    for (const [file, community] of mapping) next.set(file, superMapping.get(community) ?? community);
     if ([...new Set(next.values())].length === comms.length) break;
+
     mapping = next;
+    levelMapping = superMapping;
     g = superGraph;
   }
 

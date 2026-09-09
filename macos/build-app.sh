@@ -8,9 +8,11 @@
 # means there is no interpreter to bundle — Homebrew's node links against a
 # dozen keg-relative dylibs and does not survive being copied anyway.
 #
-# Node 22.5 or newer is required. On an older runtime the engine falls back to
-# better-sqlite3 if it happens to be installed, but that is a courtesy, not the
-# supported path.
+# Node 22.5 or newer is required, and the bundle deliberately does NOT carry a
+# compiled better-sqlite3: a .node built here works only for this exact Node ABI
+# and CPU, so shipping one hands anyone else a dyld trace instead of the engine's
+# own message naming the version it needs. The fallback stays available to anyone
+# who installs it themselves.
 
 set -euo pipefail
 
@@ -21,14 +23,28 @@ APP="$ROOT/dist/$APP_NAME.app"
 
 # ── the node the app will actually run ───────────────────────────────────────
 # Same lookup order as EngineLocator, so the build verifies what ships.
+# Mirrors EngineLocator: prefer a runtime that has node:sqlite over merely the
+# first one on the list, so the build verifies what the app will actually use.
+capable() {
+  local v major minor
+  v="$("$1" -v 2>/dev/null)" || return 1
+  v="${v#v}"
+  major="${v%%.*}"; v="${v#*.}"; minor="${v%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  (( major > 22 )) || { (( major == 22 )) && (( minor >= 5 )); }
+}
+
 pick_node() {
   if [[ -n "${REPODECK_NODE:-}" && -x "${REPODECK_NODE}" ]]; then
     echo "$REPODECK_NODE"; return
   fi
-  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
-    [[ -x "$candidate" ]] && { echo "$candidate"; return; }
+  local fallback=""
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node "$(command -v node || true)"; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    capable "$candidate" && { echo "$candidate"; return; }
+    [[ -z "$fallback" ]] && fallback="$candidate"
   done
-  command -v node || true
+  echo "$fallback"
 }
 
 NODE_BIN="$(pick_node)"
@@ -42,8 +58,9 @@ NODE_MINOR="$(echo "${NODE_VERSION#v}" | cut -d. -f2)"
 echo "▶ Engine runtime: $NODE_BIN (${NODE_VERSION})"
 
 if (( NODE_MAJOR < 22 )) || { (( NODE_MAJOR == 22 )) && (( NODE_MINOR < 5 )); }; then
-  echo "⚠ ${NODE_VERSION} has no node:sqlite. The engine will need better-sqlite3;"
-  echo "  install Node 22.5+ (brew install node) for the supported path."
+  echo "✗ ${NODE_VERSION} has no node:sqlite, so this build cannot be verified"
+  echo "  against the runtime it ships for. Install Node 22.5+ (brew install node)."
+  exit 1
 fi
 
 if [[ ! -d "$ROOT/engine/node_modules" ]]; then
@@ -69,7 +86,21 @@ else
 fi
 
 echo "▶ Copying engine…"
-rsync -a --delete --exclude '.git' "$ROOT/engine/" "$APP/Contents/Resources/engine/"
+rsync -a --delete --exclude '.git' \
+      --exclude 'node_modules/better-sqlite3' \
+      --exclude 'node_modules/.package-lock.json' \
+      --exclude 'node_modules/**/*.node' \
+      --exclude 'node_modules/**/prebuilds' \
+      --exclude 'node_modules/**/build/Release' \
+      "$ROOT/engine/" "$APP/Contents/Resources/engine/"
+
+# Nothing compiled may ride along: a native binary in the bundle is either
+# useless on another machine or actively confusing.
+if find "$APP/Contents/Resources/engine" -name '*.node' -print -quit | grep -q .; then
+  echo "✗ A compiled .node slipped into the bundle:"
+  find "$APP/Contents/Resources/engine" -name '*.node'
+  exit 1
+fi
 
 echo "▶ Ad-hoc code signing…"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || \

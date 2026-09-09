@@ -38,6 +38,26 @@ function getRepo(repoId) {
   return r;
 }
 
+/**
+ * Has this repository been removed while we were working?
+ *
+ * Deleting a repository cascades, so an index still running against it starts
+ * writing rows whose parent is gone and fails with a raw "FOREIGN KEY constraint
+ * failed" several stages later. Checking at the stage boundaries turns that into
+ * a clean stop.
+ */
+function stillExists(repoId) {
+  return Boolean(db.prepare(`SELECT 1 AS ok FROM repos WHERE id = ?`).get(repoId));
+}
+
+class RepoRemoved extends Error {
+  constructor(repoId) {
+    super(`repository ${repoId} was removed while it was being indexed`);
+    this.name = "RepoRemoved";
+    this.removed = true;
+  }
+}
+
 function creds(repo) {
   return { url: repo.url, auth_type: repo.auth_type, credential_ref: repo.credential_ref };
 }
@@ -135,12 +155,23 @@ function buildStaticEdges(repoId, dir, scanned) {
  */
 function buildSymbolGraph(repoId, scanned, resolvedImports) {
   const insertSymbol = db.prepare(
-    `INSERT INTO symbols (repo_id, path, name, kind, line, signature, params, exported, layer, module, deleted)
-     VALUES (@repo_id, @path, @name, @kind, @line, @signature, @params, @exported, @layer, @module, 0)
+    `INSERT INTO symbols (repo_id, path, name, kind, line, signature, params, exported, layer, module, deleted, source_sha)
+     VALUES (@repo_id, @path, @name, @kind, @line, @signature, @params, @exported, @layer, @module, 0, @source_sha)
      ON CONFLICT(repo_id, path, name) DO UPDATE SET
        kind = excluded.kind, line = excluded.line, signature = excluded.signature,
        params = excluded.params, exported = excluded.exported, layer = excluded.layer,
-       module = excluded.module, deleted = 0`,
+       module = excluded.module, deleted = 0, source_sha = excluded.source_sha,
+       -- Two ways a stored contract stops being true, and both clear it.
+       --
+       -- A name that was deleted and has come back is a different function that
+       -- happens to share a path and a name. And a file whose contents changed
+       -- may have rewritten the body entirely while the signature stayed put —
+       -- the contract then describes code that is gone. Either way the symbol
+       -- goes back in the enrichment queue rather than asserting stale facts.
+       purpose      = CASE WHEN symbols.deleted = 1 OR symbols.source_sha IS NOT excluded.source_sha THEN NULL ELSE symbols.purpose END,
+       returns      = CASE WHEN symbols.deleted = 1 OR symbols.source_sha IS NOT excluded.source_sha THEN NULL ELSE symbols.returns END,
+       side_effects = CASE WHEN symbols.deleted = 1 OR symbols.source_sha IS NOT excluded.source_sha THEN NULL ELSE symbols.side_effects END,
+       throws       = CASE WHEN symbols.deleted = 1 OR symbols.source_sha IS NOT excluded.source_sha THEN NULL ELSE symbols.throws END`,
   );
 
   const fileMeta = new Map(
@@ -166,6 +197,7 @@ function buildSymbolGraph(repoId, scanned, resolvedImports) {
           exported: symbol.exported ? 1 : 0,
           layer: meta.layer || null,
           module: meta.module || null,
+          source_sha: file.sha || null,
         });
       }
     }
@@ -303,7 +335,17 @@ Top-level directories: ${[...new Set(scanned.map((f) => f.path.split("/")[0]))].
       updateFile.run(f.layer, f.role, f.module, f.summary, repoId, f.path);
     }
 
-    db.prepare(`DELETE FROM edges WHERE repo_id = ? AND source = 'llm'`).run(repoId);
+    // Only clear inferred edges for the files being re-mapped. Deleting them
+    // repo-wide on an incremental run and re-inserting only the subset meant the
+    // graph shed its inferred edges a little more with every sync.
+    const remapped = new Set(scanned.map((f) => f.path));
+    const clearFor = db.prepare(
+      `DELETE FROM edges WHERE repo_id = ? AND source = 'llm' AND src_id = ?`,
+    );
+    for (const p of remapped) {
+      const fileId = ids.get(p);
+      if (fileId) clearFor.run(repoId, fileId);
+    }
     const staticPairs = new Set(
       db
         .prepare(`SELECT src_id, dst_id FROM edges WHERE repo_id = ? AND source = 'static'`)
@@ -464,12 +506,14 @@ async function indexRepo(repoId, opts = {}) {
 
     // ── static analysis ──────────────────────────────────────────────────────
     setStatus(repoId, "indexing", "Scanning source tree");
+    if (!stillExists(repoId)) throw new RepoRemoved(repoId);
     setProgress(repoId, "Scanning source tree");
     const scanned = scanRepo(dir);
     const manifests = readManifests(dir);
     upsertFiles(repoId, scanned);
     const resolvedImports = buildStaticEdges(repoId, dir, scanned);
 
+    if (!stillExists(repoId)) throw new RepoRemoved(repoId);
     setProgress(repoId, "Building the call graph");
     buildSymbolGraph(repoId, scanned, resolvedImports);
 
@@ -481,6 +525,7 @@ async function indexRepo(repoId, opts = {}) {
     buildErrorCatalogue(repoId, dir, scanned);
     buildTestMap(repoId, dir, scanned, resolvedImports);
 
+    if (!stillExists(repoId)) throw new RepoRemoved(repoId);
     setProgress(repoId, "Reading merge history");
     const commits = await git.listMergeCommits(dir, c, branch, {
       sinceSha: full ? null : previousSha,
@@ -490,22 +535,59 @@ async function indexRepo(repoId, opts = {}) {
 
     // ── model passes ─────────────────────────────────────────────────────────
     let toMap = scanned;
+    // What this sync actually touched, so the knowledge-graph passes can be
+    // scoped to it instead of re-deriving the whole repository every hour.
+    let changedPaths = null;
     if (!full) {
       const touched = new Set(commits.flatMap((x) => x.files.map((f) => f.path)));
       // Neighbours of touched files get re-mapped too, so edges stay coherent.
+      // Both directions. Following outgoing edges only re-mapped what a changed
+      // file imports and missed everything that imports IT — which is the side
+      // that actually breaks when an export is renamed or removed.
+      const placeholders = [...touched].map(() => "?").join(",") || "''";
       const neighbours = new Set(
         db
           .prepare(
             `SELECT DISTINCT f2.path AS path
-             FROM edges e
-             JOIN files f1 ON f1.id = e.src_id
-             JOIN files f2 ON f2.id = e.dst_id
-             WHERE e.repo_id = ? AND f1.path IN (${[...touched].map(() => "?").join(",") || "''"})`,
+               FROM edges e
+               JOIN files f1 ON f1.id = e.src_id
+               JOIN files f2 ON f2.id = e.dst_id
+              WHERE e.repo_id = ? AND f1.path IN (${placeholders})
+             UNION
+             SELECT DISTINCT f1.path AS path
+               FROM edges e
+               JOIN files f1 ON f1.id = e.src_id
+               JOIN files f2 ON f2.id = e.dst_id
+              WHERE e.repo_id = ? AND f2.path IN (${placeholders})`,
           )
-          .all(repoId, ...touched)
+          .all(repoId, ...touched, repoId, ...touched)
           .map((r) => r.path),
       );
       toMap = scanned.filter((f) => touched.has(f.path) || neighbours.has(f.path));
+
+      // Now that dependents count too, touching one widely-imported file pulls
+      // in most of the repository — which is the whole cost the incremental path
+      // exists to avoid. Keep the touched files and as many neighbours as the
+      // budget allows, most-connected first.
+      const cap = Math.max(touched.size, config.limits.remapMaxFiles);
+      if (toMap.length > cap) {
+        const degree = new Map(
+          db
+            .prepare(`SELECT path, degree FROM files WHERE repo_id = ?`)
+            .all(repoId)
+            .map((r) => [r.path, r.degree]),
+        );
+        const ranked = toMap
+          .filter((f) => !touched.has(f.path))
+          .sort((a, b) => (degree.get(b.path) || 0) - (degree.get(a.path) || 0));
+        toMap = [
+          ...toMap.filter((f) => touched.has(f.path)),
+          ...ranked.slice(0, Math.max(0, cap - touched.size)),
+        ];
+        emit({ t: "remap_capped", repoId, cap, touched: touched.size });
+      }
+
+      changedPaths = new Set(toMap.map((f) => f.path));
     }
 
     // Tests inflate the bill without describing the architecture; they still
@@ -525,6 +607,20 @@ async function indexRepo(repoId, opts = {}) {
       taxonomy = await consolidateModules(cfg, repoId);
     }
 
+    // Symbols carry a copy of their file's layer and module so the call graph can
+    // be grouped without a join. That copy is stamped on during symbol
+    // extraction, which runs BEFORE the model classifies the files — so on a
+    // first index every symbol was written with the heuristic layer and a null
+    // module, and the exported call graph said `"module": null` for everything.
+    // Re-sync once the real classification exists.
+    db.prepare(
+      `UPDATE symbols
+          SET layer  = (SELECT f.layer  FROM files f WHERE f.repo_id = symbols.repo_id AND f.path = symbols.path),
+              module = (SELECT f.module FROM files f WHERE f.repo_id = symbols.repo_id AND f.path = symbols.path)
+        WHERE repo_id = ? AND deleted = 0`,
+    ).run(repoId);
+
+    if (!stillExists(repoId)) throw new RepoRemoved(repoId);
     setProgress(repoId, "Clustering and computing the heatmap");
     detectCommunities(repoId);
     recomputeHeat(repoId);
@@ -564,6 +660,8 @@ async function indexRepo(repoId, opts = {}) {
         manifests,
         resolvedImports,
         taxonomy,
+        full,
+        changedPaths,
       }, {
         commits: full ? commits.slice(0, 25) : commits,
         diffstat,
@@ -596,6 +694,13 @@ async function indexRepo(repoId, opts = {}) {
       providerError,
     };
   } catch (err) {
+    if (err && err.removed) {
+      // The row is already gone; writing status to it would do nothing, and this
+      // is not a failure the user needs to see.
+      finishJob(jobId, "cancelled", err.message);
+      emit({ t: "index_cancelled", repoId, reason: "repository removed" });
+      return { cancelled: true };
+    }
     setStatus(repoId, "error", err.message);
     setProgress(repoId, "");
     finishJob(jobId, "error", err.message);
@@ -616,25 +721,28 @@ async function indexRepo(repoId, opts = {}) {
 async function applyUpdateOrStop(repoId, dir, c, branch, strategy) {
   const state = await git.worktreeState(dir, c, branch);
 
-  if (strategy === "reset" && !state.clean) {
-    emit({
-      t: "pull_guard",
-      repoId,
-      reason: "local-work",
-      dirty: state.dirtyFiles.length,
-      ahead: state.ahead,
-    });
+  const mergeInstead = async (reason) => {
+    emit({ t: "pull_guard", repoId, reason, dirty: state.dirtyFiles.length, ahead: state.ahead });
     const merged = await git.applyUpdate(dir, c, branch, "merge");
     if (!merged.ok) {
       db.prepare(`UPDATE repos SET status_detail = ? WHERE id = ?`).run(
-        `Merge conflict in ${merged.conflicts.join(", ")}`,
+        merged.conflicts.length
+          ? `Merge conflict in ${merged.conflicts.join(", ")}`
+          : merged.refused || "the update could not be applied",
         repoId,
       );
     }
     return merged;
-  }
+  };
 
-  return git.applyUpdate(dir, c, branch, strategy);
+  if (strategy === "reset" && !state.clean) return mergeInstead("local-work");
+
+  const result = await git.applyUpdate(dir, c, branch, strategy);
+  // The reset path refuses when the branch it would force-move has commits
+  // origin does not — which the current-branch check cannot see. Merging keeps
+  // them, which is the whole point of refusing.
+  if (result.refused) return mergeInstead("unpushed-commits");
+  return result;
 }
 
 module.exports = {

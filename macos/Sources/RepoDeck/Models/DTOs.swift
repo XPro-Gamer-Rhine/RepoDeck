@@ -970,6 +970,9 @@ struct DeployStatus: Codable {
     let enabled: Bool
     let autoDeploy: Bool
     let supervised: Bool
+    /// The port it is actually serving on, which is not always the configured
+    /// one — an app is free to ignore the port RepoDeck guessed for it.
+    let port: Int?
     let profile: DeployProfile?
 }
 

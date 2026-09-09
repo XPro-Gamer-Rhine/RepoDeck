@@ -27,6 +27,12 @@ const cronTasks = new Map();
 /** repoId -> interval handle */
 const watchers = new Map();
 
+/** repoId -> the conflict signature a human has already been asked about. */
+const awaitingReview = new Map();
+
+/** repoId -> true while a watcher tick is in flight, so ticks cannot overlap. */
+const watching = new Set();
+
 function isValidCron(expr) {
   return cron.validate(expr);
 }
@@ -57,8 +63,12 @@ function activeToken() {
  */
 async function syncRepo(repoId, reason) {
   const repo = db.prepare(`SELECT * FROM repos WHERE id = ?`).get(repoId);
-  if (!repo) return { skipped: "gone" };
-  if (isRunning(repoId)) return { skipped: "already running" };
+  // These carry `changed: false` explicitly. Callers used to test
+  // `result.changed !== false`, and a skip returning no `changed` key at all
+  // passed that test — so a watcher tick that collided with a running sync
+  // marked its pull requests ingested and they were never summarised.
+  if (!repo) return { skipped: "gone", changed: false };
+  if (isRunning(repoId)) return { skipped: "already running", changed: false };
 
   emit({ t: "sync_start", repoId, reason });
 
@@ -72,8 +82,28 @@ async function syncRepo(repoId, reason) {
         emit({ t: "sync_blocked", repoId, conflicts: result.conflicts, reason: "conflict" });
         return { blocked: true, conflicts: result.conflicts };
       }
+      // Once a conflict has been put in front of a person, re-running the model
+      // on every tick spends money to produce the same answer and re-notifies
+      // about the same thing. Try once, then leave it alone until the tree changes.
+      const signature = result.conflicts.slice().sort().join("|");
+      if (awaitingReview.get(repoId) === signature) {
+        emit({ t: "sync_blocked", repoId, conflicts: result.conflicts, reason: "already awaiting review" });
+        return { blocked: true, conflicts: result.conflicts };
+      }
+
       progress("sync", "Resolving merge conflicts", { repoId });
-      const resolved = await conflict.autoResolve(repoId);
+      let resolved;
+      try {
+        resolved = await conflict.autoResolve(repoId);
+      } catch (err) {
+        // The point of this map is "a model pass has already been spent on this
+        // exact conflict", which is just as true when the pass ended in an
+        // exception. Without this the same conflict was re-analysed at high
+        // effort on every tick, indefinitely, against a paid API.
+        awaitingReview.set(repoId, signature);
+        throw err;
+      }
+      if (resolved.blocked) awaitingReview.set(repoId, signature);
       if (resolved.blocked) {
         emit({ t: "sync_blocked", repoId, conflicts: result.conflicts, reason: "needs review" });
         return { blocked: true, conflicts: result.conflicts, resolutions: resolved.resolutions };
@@ -82,22 +112,45 @@ async function syncRepo(repoId, reason) {
       return syncRepo(repoId, `${reason} (after conflict resolution)`);
     }
 
+    awaitingReview.delete(repoId);
+
+    if (result.cancelled) {
+      // The repository was removed while it was being indexed. Nothing landed,
+      // and reporting a successful sync for a row that no longer exists left the
+      // UI showing a phantom result.
+      emit({ t: "sync_done", repoId, reason, changed: false, cancelled: true });
+      return { changed: false, cancelled: true };
+    }
+
     if (result.upToDate) {
       emit({ t: "sync_done", repoId, reason, changed: false });
       return { changed: false };
     }
 
     // Redeploy only when the app is meant to be running and something landed.
-    const fresh = db.prepare(`SELECT auto_deploy, deploy_enabled, deploy_state FROM repos WHERE id = ?`).get(repoId);
-    if (fresh && fresh.auto_deploy && fresh.deploy_enabled) {
+    const fresh = db
+      .prepare(`SELECT auto_deploy, deploy_enabled, deploy_state FROM repos WHERE id = ?`)
+      .get(repoId);
+    // "failed" is worth restarting; "stopped" means a person stopped it, and an
+    // unattended sync quietly starting it again is the app overriding a decision
+    // the user made on purpose.
+    const wasDeliberatelyStopped = fresh && fresh.deploy_state === "stopped";
+    if (fresh && fresh.auto_deploy && fresh.deploy_enabled && !wasDeliberatelyStopped) {
+      // Only the files this sync actually brought in. The previous query asked
+      // for thirty days of history, so "did a lock file change?" was answered
+      // about the last month rather than about this merge — and dependencies
+      // were reinstalled on almost every deploy.
       const changed = db
         .prepare(
           `SELECT DISTINCT fc.path AS path
            FROM file_changes fc
            JOIN commits c ON c.id = fc.commit_id
-           WHERE fc.repo_id = ? AND c.sha != ? AND c.committed_at >= datetime('now', '-30 days')`,
+           WHERE fc.repo_id = ?
+             AND (? = '' OR c.committed_at > (
+                   SELECT committed_at FROM commits WHERE repo_id = ? AND sha = ?
+                 ))`,
         )
-        .all(repoId, result.previousSha || "")
+        .all(repoId, result.previousSha || "", repoId, result.previousSha || "")
         .map((r) => r.path);
       progress("sync", "Redeploying with the new code", { repoId });
       await deploy.redeploy(repoId, changed).catch((err) => {
@@ -125,6 +178,12 @@ async function syncRepo(repoId, reason) {
 async function checkForWork(repoId) {
   const repo = db.prepare(`SELECT * FROM repos WHERE id = ?`).get(repoId);
   if (!repo) return { gone: true };
+
+  // An index in flight owns this working tree. The watcher's fallback path runs
+  // `git fetch` on that same directory, which moves refs/remotes/origin/<branch>
+  // underneath it — the index then records a last_indexed_sha for commits it
+  // never scanned, and those commits are never indexed by anything.
+  if (isRunning(repoId)) return { skipped: "indexing", moved: false, mergedPrs: [] };
 
   db.prepare(`UPDATE repos SET last_watch_at = datetime('now') WHERE id = ?`).run(repoId);
 
@@ -173,7 +232,10 @@ async function checkForWork(repoId) {
     : "default branch moved";
   const result = await syncRepo(repoId, reason);
 
-  if (!result.error && !result.blocked && newlyMerged.length) {
+  // `changed === false` means the sync was a no-op — the repository was gone, or
+  // another run held the lock. Marking the PR ingested then loses it forever.
+  // A positive signal, not the absence of a negative one.
+  if (result.changed === true && !result.error && !result.blocked && newlyMerged.length) {
     const mark = db.prepare(`UPDATE pull_requests SET ingested = 1 WHERE repo_id = ? AND number = ?`);
     for (const pr of newlyMerged) mark.run(repoId, pr.number);
   }
@@ -223,9 +285,24 @@ function recordPullRequests(repoId, prs) {
 // ── scheduling ───────────────────────────────────────────────────────────────
 
 function unschedule(repoId) {
+  awaitingReview.delete(repoId);
+  // `watching` is NOT cleared here. It marks a checkForWork that is still in
+  // flight, and unschedule cannot cancel that — clearing the flag let the next
+  // schedule's first tick start a second concurrent run on the same repository,
+  // and its `finally` then deleted the flag the first run was still relying on.
+  // The tick's own `finally` is the only thing that should clear it.
   const task = cronTasks.get(repoId);
   if (task) {
     task.stop();
+    // node-cron keeps every scheduled task in a module-global registry and
+    // stop() only clears the timer, so rescheduling a repo leaked one entry per
+    // change — measured: three schedule/stop cycles leave three live tasks.
+    try {
+      const name = task.options && task.options.name;
+      if (name && typeof cron.getTasks === "function") cron.getTasks().delete(name);
+    } catch {
+      /* a leaked registry entry is not worth failing a reschedule over */
+    }
     cronTasks.delete(repoId);
   }
   const watcher = watchers.get(repoId);
@@ -265,7 +342,13 @@ function scheduleRepo(repoId) {
     watchers.set(
       repoId,
       setInterval(() => {
-        checkForWork(repoId).catch(() => {});
+        // A tick that overruns its interval would otherwise stack up behind
+        // itself; on a slow network that is several concurrent GitHub polls.
+        if (watching.has(repoId)) return;
+        watching.add(repoId);
+        checkForWork(repoId)
+          .catch(() => {})
+          .finally(() => watching.delete(repoId));
       }, minutes * 60_000),
     );
   }

@@ -31,6 +31,24 @@ const config = {
     mapBatchSize: 12,
     /** Parallel model calls. */
     maxConcurrency: 4,
+    /**
+     * Ceilings on the knowledge-graph passes.
+     *
+     * Each pass fans out one model call per batch with nothing bounding the
+     * number of batches, so a large repository turned a single index into
+     * hundreds of paid calls — and, because the passes were handed the whole
+     * tree rather than the files that changed, it did it again on every
+     * scheduled pull. Ranked selection plus these caps keeps a sync's cost
+     * proportional to the change, not to the repository.
+     */
+    kgMaxFilesPerPass: 400,
+    /**
+     * Ceiling on the files one incremental sync re-maps. The expansion follows
+     * edges in both directions, so a change to a widely-imported file would
+     * otherwise pull in most of the repository and cost as much as a full index.
+     */
+    remapMaxFiles: 150,
+    kgMaxModules: 40,
     /** Deploy log ring buffer kept in memory for the UI. */
     logTailLines: 2000,
   },

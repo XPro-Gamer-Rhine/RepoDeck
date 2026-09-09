@@ -38,7 +38,20 @@ final class RepoDetail: ObservableObject {
         didSet { Task { await loadGraph() } }
     }
     @Published var hideTests = true { didSet { Task { await loadGraph() } } }
-    @Published var minHeat: Double = 0 { didSet { Task { await loadGraph() } } }
+    // Dragging the slider fires this continuously. Each tick was a full graph
+    // round trip, and responses could land out of order — so releasing the slider
+    // sometimes left the graph showing a threshold from halfway through the drag.
+    @Published var minHeat: Double = 0 { didSet { scheduleGraphReload() } }
+    private var graphReloadTask: Task<Void, Never>?
+
+    private func scheduleGraphReload() {
+        graphReloadTask?.cancel()
+        graphReloadTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.loadGraph()
+        }
+    }
     @Published var colourBy: ColourMode = .layer
     @Published var hiddenLayers: Set<String> = []
     @Published var selectedNode: GraphNode?
@@ -77,9 +90,14 @@ final class RepoDetail: ObservableObject {
         _ = await (g, h, c, a, p, j, d)
     }
 
+    private var graphRequestSeq = 0
+
     func loadGraph() async {
+        graphRequestSeq += 1
+        let seq = graphRequestSeq
         isLoadingGraph = true
-        defer { isLoadingGraph = false }
+        defer { if seq == graphRequestSeq { isLoadingGraph = false } }
+
         var params: [String: Any] = [
             "repoId": repoId,
             "hideTests": hideTests,
@@ -87,8 +105,13 @@ final class RepoDetail: ObservableObject {
         ]
         if grouping != "auto" { params["nodes"] = grouping }
         do {
-            graph = try await engine.call("graph.get", params)
+            let result: GraphData = try await engine.call("graph.get", params)
+            // Last request wins, not last response. Two graph loads in flight can
+            // finish out of order, and the older one would overwrite the newer.
+            guard seq == graphRequestSeq else { return }
+            graph = result
         } catch {
+            guard seq == graphRequestSeq else { return }
             errorText = error.localizedDescription
         }
     }

@@ -15,7 +15,7 @@ const path = require("node:path");
 const { db, json: parseJson } = require("../db");
 const { config } = require("../config");
 const providers = require("../providers");
-const { progress } = require("../events");
+const { emit, progress } = require("../events");
 const { chunk } = require("./map");
 
 // ── function contracts ───────────────────────────────────────────────────────
@@ -139,10 +139,17 @@ Only state what the source supports. An empty array is a fine answer; an invente
     (done, total) => progress("kg", `Function contracts: ${done}/${total} batches`, { repoId }),
   );
 
+  // Only the functions that were actually asked about may be written. The model
+  // returns path+name pairs, and one it invented — or copied from an example —
+  // would otherwise overwrite a correct contract belonging to a different
+  // function that happens to match.
+  const asked = new Set(targets.map((t) => `${t.path}\u0000${t.name}`));
+
   db.transaction(() => {
     for (const r of results) {
       if (!r || r.error) continue;
       for (const fn of r.functions || []) {
+        if (!asked.has(`${fn.path}\u0000${fn.name}`)) continue;
         update.run(
           fn.purpose || null,
           fn.returns || null,
@@ -225,13 +232,34 @@ async function buildPlaybooks(cfg, repoId, opts = {}) {
   // them, and allow a slice. A long repository should not have to start over
   // because one run was interrupted.
   if (!opts.force) {
-    const done = new Set(
+    // Resumable, but not permanent. Skipping every module that already has a
+    // playbook meant one was written once and then kept naming files and error
+    // strings the module no longer had, for the life of the repository. A
+    // playbook is fresh only while the module it describes has not moved since.
+    const written = new Map(
       db
-        .prepare(`SELECT key FROM kg_docs WHERE repo_id = ? AND kind = 'playbook'`)
+        .prepare(`SELECT key, updated_at FROM kg_docs WHERE repo_id = ? AND kind = 'playbook'`)
         .all(repoId)
-        .map((r) => r.key),
+        .map((r) => [r.key, r.updated_at]),
     );
-    modules = modules.filter((m) => !done.has(m.module));
+    const lastChange = new Map(
+      db
+        .prepare(
+          `SELECT module, MAX(last_change_at) AS changed
+             FROM files
+            WHERE repo_id = ? AND deleted = 0 AND module IS NOT NULL AND module != ''
+            GROUP BY module`,
+        )
+        .all(repoId)
+        .map((r) => [r.module, r.changed]),
+    );
+    modules = modules.filter((m) => {
+      const doc = written.get(m.module);
+      if (!doc) return true;                       // never written
+      const changed = lastChange.get(m.module);
+      if (!changed) return false;                  // nothing to compare against
+      return changed > doc;                        // ISO-8601 strings sort chronologically
+    });
   }
   if (opts.only && opts.only.length) modules = modules.filter((m) => opts.only.includes(m.module));
   if (opts.limit) modules = modules.slice(0, opts.limit);
@@ -329,6 +357,15 @@ ${flows
 
   for (const r of results) {
     if (!r || r.error) continue;
+    // A response that parsed but said nothing is not a playbook. Storing it
+    // filled the slot, and the resume filter above then skipped that module
+    // forever — one bad call permanently cost the repository a playbook.
+    const hasContent = (Array.isArray(r.playbooks) && r.playbooks.length > 0)
+      || (Array.isArray(r.invariants) && r.invariants.length > 0);
+    if (!hasContent) {
+      emit({ t: "playbook_empty", repoId, module: r.module });
+      continue;
+    }
     put.run(repoId, r.module, `Playbook: ${r.module}`, JSON.stringify(r));
     written++;
   }

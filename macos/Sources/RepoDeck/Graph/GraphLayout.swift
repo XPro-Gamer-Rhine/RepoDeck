@@ -48,6 +48,13 @@ final class GraphLayout: ObservableObject {
 
     // Node state, parallel arrays indexed the same as `nodes`.
     private(set) var nodes: [GraphNode] = []
+
+    /// Lowercased "path module role" per node, for the search filter.
+    ///
+    /// Search runs inside the draw path, so building this on the fly meant three
+    /// string allocations per node per frame. Built once here instead; it only
+    /// changes when the graph does.
+    private(set) var searchKeys: [String] = []
     private(set) var position: [SIMD2<Double>] = []
     private var velocity: [SIMD2<Double>] = []
 
@@ -114,6 +121,7 @@ final class GraphLayout: ObservableObject {
         depthVelocity = Array(repeating: 0, count: count)
         pinned = Array(repeating: false, count: count)
         radius = nodes.map { Self.nodeRadius(for: $0) }
+        searchKeys = nodes.map { "\($0.path) \($0.module ?? "") \($0.role ?? "")".lowercased() }
         adjacency = Array(repeating: [], count: count)
 
         links = graph.edges.compactMap { edge in
@@ -188,6 +196,7 @@ final class GraphLayout: ObservableObject {
         velocity = Array(repeating: .zero, count: nodes.count)
         depthVelocity = Array(repeating: 0, count: nodes.count)
         if mode != .orbit { depth = Array(repeating: 0, count: nodes.count) }
+        invalidateBounds()
     }
 
     /// Every node on a ring, ordered by layer then module, so cross-cutting
@@ -360,6 +369,7 @@ final class GraphLayout: ObservableObject {
         applyCentering()
         integrate()
 
+        invalidateBounds()
         frame += 1
     }
 
@@ -501,6 +511,7 @@ final class GraphLayout: ObservableObject {
     func pin(_ index: Int, at point: CGPoint) {
         guard nodes.indices.contains(index) else { return }
         pinned[index] = true
+        invalidateBounds()
         position[index] = SIMD2(Double(point.x), Double(point.y))
         velocity[index] = .zero
         if index < depthVelocity.count { depthVelocity[index] = 0 }
@@ -531,31 +542,58 @@ final class GraphLayout: ObservableObject {
     }
 
     /// The bounding box of everything laid out, for "fit to window".
+    /// Centre and radius of the point cloud, recomputed once per simulation step.
+    ///
+    /// These are four full passes over every node. The projection needs them, and
+    /// the projection runs on every hover event as well as every frame — so
+    /// recomputing them per call turned a mouse move into eight passes over the
+    /// graph. They only change when positions change, so they are cached and
+    /// invalidated by the step.
+    private var cachedBounds: (centre: SIMD3<Double>, radius: Double)?
+
+    private func invalidateBounds() { cachedBounds = nil }
+
+    func cloudBounds() -> (centre: SIMD3<Double>, radius: Double) {
+        if let cachedBounds { return cachedBounds }
+        let computed = (centre: computeCentre(), radius: computeRadius())
+        cachedBounds = computed
+        return computed
+    }
+
     /// The radius of the point cloud, used to place the camera in orbit mode.
-    func contentRadius() -> Double {
+    func contentRadius() -> Double { cloudBounds().radius }
+
+    /// The centre of the point cloud in three dimensions.
+    func contentCentre() -> SIMD3<Double> { cloudBounds().centre }
+
+    private func computeRadius() -> Double {
         guard !position.isEmpty else { return 1 }
-        let cx = position.reduce(0.0) { $0 + $1.x } / Double(position.count)
-        let cy = position.reduce(0.0) { $0 + $1.y } / Double(position.count)
-        let cz = depth.reduce(0.0, +) / Double(max(1, depth.count))
+        let centre = computeCentre()
         var maximum = 1.0
         for i in position.indices {
-            let dx = position[i].x - cx
-            let dy = position[i].y - cy
-            let dz = (i < depth.count ? depth[i] : 0) - cz
-            maximum = max(maximum, (dx * dx + dy * dy + dz * dz).squareRoot() + radius[i])
+            let dx = position[i].x - centre.x
+            let dy = position[i].y - centre.y
+            let dz = (i < depth.count ? depth[i] : 0) - centre.z
+            // radius[] can be shorter than position[] for one frame if a load
+            // races a step; treat a missing entry as a point.
+            let r = i < radius.count ? radius[i] : 0
+            maximum = max(maximum, (dx * dx + dy * dy + dz * dz).squareRoot() + r)
         }
         return maximum
     }
 
-    /// The centre of the point cloud in three dimensions.
-    func contentCentre() -> SIMD3<Double> {
+    private func computeCentre() -> SIMD3<Double> {
         guard !position.isEmpty else { return SIMD3(midX, midY, 0) }
+        // One pass, not three: the three separate reduces walked the array three
+        // times to produce one point.
+        var sx = 0.0, sy = 0.0, sz = 0.0
+        for i in position.indices {
+            sx += position[i].x
+            sy += position[i].y
+            sz += i < depth.count ? depth[i] : 0
+        }
         let n = Double(position.count)
-        return SIMD3(
-            position.reduce(0.0) { $0 + $1.x } / n,
-            position.reduce(0.0) { $0 + $1.y } / n,
-            depth.reduce(0.0, +) / Double(max(1, depth.count))
-        )
+        return SIMD3(sx / n, sy / n, sz / n)
     }
 
     func contentBounds() -> CGRect {

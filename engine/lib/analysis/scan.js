@@ -4,6 +4,7 @@
 // and evidence-based — the model never sees a file we did not read, and the
 // facts extracted here are what keep its answers honest later.
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { config } = require("../config");
@@ -205,6 +206,10 @@ function scanRepo(dir) {
       path: rel,
       ext: path.extname(rel),
       loc: src.split("\n").length,
+      // Cheap identity for "has this file's code changed?". Model-written
+      // per-symbol contracts are keyed on it so they expire when the source
+      // they describe does.
+      sha: crypto.createHash("sha1").update(src).digest("hex"),
       bytes: stat.size,
       imports,
       hints,

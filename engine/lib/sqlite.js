@@ -72,19 +72,23 @@ function adaptBuiltin(database) {
         const name = `rd_sp_${depth}`;
         database.exec(nested ? `SAVEPOINT ${name};` : "BEGIN;");
         depth++;
+        // Exactly one decrement, in a finally. The earlier version decremented on
+        // the way out of the try AND again in the catch, so a COMMIT that itself
+        // threw drove the counter negative — after which every later transaction
+        // mistook nesting for top level and issued BEGIN inside an open one.
         try {
           const result = fn(...args);
-          depth--;
           database.exec(nested ? `RELEASE ${name};` : "COMMIT;");
           return result;
         } catch (err) {
-          depth--;
           try {
             database.exec(nested ? `ROLLBACK TO ${name}; RELEASE ${name};` : "ROLLBACK;");
           } catch {
             // The rollback failing would mask the real error; the original wins.
           }
           throw err;
+        } finally {
+          depth--;
         }
       },
 

@@ -106,6 +106,11 @@ struct DeployTab: View {
 
     // MARK: - Profile
 
+    /// What the running process bound, falling back to what was configured.
+    /// A dev server that ignores the configured port would otherwise be linked
+    /// at an address nothing answers on.
+    private var servingPort: Int? { detail.deployStatus?.port ?? detail.deployStatus?.profile?.port }
+
     private func profileCard(_ current: DeployProfile) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             SectionCard(title: "Run profile", subtitle: current.detectedFrom, systemImage: "play.rectangle") {
@@ -133,7 +138,7 @@ struct DeployTab: View {
                         tint: stateTint
                     )
                     if let pid = detail.deployStatus?.pid { StatTile(value: "\(pid)", label: "pid") }
-                    if let port = current.port { StatTile(value: "\(port)", label: "port") }
+                    if let port = servingPort { StatTile(value: "\(port)", label: "port") }
                     StatTile(
                         value: Timestamps.relative(detail.deployStatus?.startedAt),
                         label: "started"
@@ -148,7 +153,7 @@ struct DeployTab: View {
                         } label: {
                             Label("Stop", systemImage: "stop.fill")
                         }
-                        if let port = current.port, let url = URL(string: "http://localhost:\(port)") {
+                        if let port = servingPort, let url = URL(string: "http://localhost:\(port)") {
                             Link(destination: url) {
                                 Label("Open localhost:\(port)", systemImage: "safari")
                             }

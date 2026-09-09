@@ -234,12 +234,59 @@ function logPathFor(repoId) {
   return path.join(config.logDir, `repo-${repoId}.log`);
 }
 
+/** A dev server left running for a week should not fill the disk. */
+const MAX_LOG_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The port a dev server says it is listening on.
+ *
+ * The configured port is a guess: it is read from `.env.example` when there is
+ * no `.env`, or from a framework default, and the process is free to ignore it.
+ * When that guess is wrong the health check waits out its whole timeout and
+ * reports failure while the app is up and serving — which is exactly the state
+ * that looks like a RepoDeck bug and is not one.
+ *
+ * Every dev server announces itself; this reads the announcement. Deliberately
+ * narrow, because a port-shaped number appears in plenty of unrelated output.
+ */
+const PORT_ANNOUNCEMENT = [
+  /(?:listening|running|started|ready|available)\b[^\n]*?\bon\b[^\n]*?:?(\d{2,5})\b/i,
+  /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])(?::(\d{2,5}))/i,
+  /\bport[:\s=]+(\d{2,5})\b/i,
+];
+
+function noticePort(entry, line) {
+  if (!entry || entry.observedPort) return;
+  for (const pattern of PORT_ANNOUNCEMENT) {
+    const m = line.match(pattern);
+    if (!m) continue;
+    const port = Number(m[1]);
+    if (port >= 1024 && port <= 65535) {
+      entry.observedPort = port;
+      return;
+    }
+  }
+}
+
 function pushLog(entry, stream, text) {
   for (const line of String(text).split(/\r?\n/)) {
     if (!line) continue;
+    noticePort(entry, line);
     entry.buffer.push({ stream, text: line, at: Date.now() });
     if (entry.buffer.length > config.limits.logTailLines) entry.buffer.shift();
     emit({ t: "deploy_log", repoId: entry.repoId, stream, text: line });
+  }
+
+  entry.logBytes = (entry.logBytes || 0) + Buffer.byteLength(text);
+  if (entry.logBytes > MAX_LOG_BYTES) {
+    // Start a fresh file rather than growing without bound. The in-memory ring
+    // buffer still holds the recent tail, which is what the UI shows.
+    try {
+      fs.writeFileSync(entry.logPath, `[RepoDeck] log rotated after ${MAX_LOG_BYTES} bytes\n`);
+    } catch {
+      /* the log is a convenience, not a requirement */
+    }
+    entry.logBytes = 0;
   }
   fs.appendFile(entry.logPath, text, () => {});
 }
@@ -265,20 +312,45 @@ async function waitForHealth(profile, entry) {
   const deadline = Date.now() + (profile.healthTimeoutSec || 120) * 1000;
 
   while (Date.now() < deadline) {
-    if (!entry.child || entry.child.exitCode !== null) {
+    if (entry.spawnError) {
+      return { healthy: false, reason: `the process could not be started: ${entry.spawnError.message}` };
+    }
+    if (!entry.child || entry.child.exitCode !== null || entry.child.signalCode !== null) {
+      // exitCode stays null for a signal-killed child, so checking it alone made
+      // the loop spin out the full timeout after the process was already dead.
       return { healthy: false, reason: "the process exited before it became healthy" };
     }
-    if (profile.port && (await portOpen(profile.port))) return { healthy: true };
-    if (!profile.port && profile.healthUrl) {
+    // A configured health URL is a stronger signal than "something is listening"
+    // — a stale process on the same port would otherwise report success — so it
+    // is checked first rather than only when no port is known.
+    if (profile.healthUrl) {
       const ok = await fetch(profile.healthUrl, { method: "GET" }).then(
         (r) => r.status < 500,
         () => false,
       );
       if (ok) return { healthy: true };
+    } else if (profile.port && (await portOpen(profile.port))) {
+      return { healthy: true };
     }
+
+    // The app announced a different port from the one that was configured.
+    // Believe the app: it is the one doing the listening.
+    if (entry.observedPort && entry.observedPort !== profile.port && (await portOpen(entry.observedPort))) {
+      pushLog(
+        entry,
+        "stderr",
+        `\n[RepoDeck] this app is serving on port ${entry.observedPort}, not the configured ${profile.port}. Using ${entry.observedPort}.\n`,
+      );
+      return { healthy: true, port: entry.observedPort };
+    }
+
     await new Promise((r) => setTimeout(r, 1500));
   }
-  return { healthy: false, reason: "health check timed out" };
+
+  const hint = entry.observedPort && entry.observedPort !== profile.port
+    ? `; the app logged port ${entry.observedPort} but nothing is listening there either`
+    : "";
+  return { healthy: false, reason: `health check timed out${hint}` };
 }
 
 // ── lifecycle ────────────────────────────────────────────────────────────────
@@ -296,7 +368,13 @@ function setState(repoId, state, extra = {}) {
 /** One shell command, run to completion, output streamed. Used for installs. */
 function runOnce(command, cwd, entry) {
   return new Promise((resolve, reject) => {
-    const child = spawn("/bin/zsh", ["-lc", command], { cwd, env: { ...process.env, CI: "1" } });
+    const child = spawn("/bin/zsh", ["-lc", command], {
+      cwd,
+      env: { ...process.env, CI: "1" },
+      // Its own group, so a stop during install can take the whole npm tree down.
+      detached: true,
+    });
+    if (entry) entry.installChild = child;
     child.stdout.on("data", (d) => pushLog(entry, "stdout", d.toString()));
     child.stderr.on("data", (d) => pushLog(entry, "stderr", d.toString()));
     child.on("error", reject);
@@ -327,6 +405,7 @@ async function start(repoId, opts = {}) {
     buffer: [],
     startedAt: Date.now(),
     child: null,
+    spawnError: null,
   };
   supervised.set(repoId, entry);
   fs.writeFileSync(entry.logPath, `\n=== ${new Date().toISOString()} — starting ${repo.name} ===\n`);
@@ -342,6 +421,11 @@ async function start(repoId, opts = {}) {
       progress("deploy", `Installing dependencies: ${profile.install}`, { repoId });
       await runOnce(profile.install, dir, entry);
     }
+    if (entry.cancelled) {
+      finishJob(jobId, "cancelled", "stopped during install");
+      supervised.delete(repoId);
+      return { ok: false, cancelled: true };
+    }
 
     progress("deploy", `Starting: ${profile.run}`, { repoId });
     const child = spawn("/bin/zsh", ["-lc", profile.run], {
@@ -352,14 +436,30 @@ async function start(repoId, opts = {}) {
     });
     entry.child = child;
 
+    // A ChildProcess that fails to spawn emits 'error', and Node turns an
+    // unhandled 'error' event into a thrown exception. Without this listener a
+    // repository whose shell cannot be spawned — EACCES, EMFILE, a missing
+    // /bin/zsh — would take down the entire engine: every schedule, every
+    // watcher, and every other repository's running app.
+    child.on("error", (err) => {
+      entry.spawnError = err;
+      pushLog(entry, "stderr", `\n[RepoDeck] could not start the process: ${err.message}\n`);
+    });
+
     child.stdout.on("data", (d) => pushLog(entry, "stdout", d.toString()));
     child.stderr.on("data", (d) => pushLog(entry, "stderr", d.toString()));
     child.on("exit", (code, signal) => {
       pushLog(entry, "stderr", `\n[RepoDeck] process exited (code ${code}, signal ${signal || "none"})\n`);
-      supervised.delete(repoId);
-      // A clean stop already set the state; only an unexpected exit is a failure.
-      const current = db.prepare(`SELECT deploy_state FROM repos WHERE id = ?`).get(repoId);
-      if (current && current.deploy_state !== "stopped") setState(repoId, "failed");
+      // Only evict this entry if it is still the current one. A redeploy stops
+      // the old child and starts a new one immediately; the old child's exit
+      // arrives up to a couple of seconds later, and an unconditional delete
+      // removed the NEW entry — orphaning a running server that nothing tracked
+      // and that a later stop() would report as "not running".
+      if (supervised.get(repoId) === entry) {
+        supervised.delete(repoId);
+        const current = db.prepare(`SELECT deploy_state FROM repos WHERE id = ?`).get(repoId);
+        if (current && current.deploy_state !== "stopped") setState(repoId, "failed");
+      }
     });
 
     setState(repoId, "starting", { pid: child.pid, startedAt: new Date().toISOString() });
@@ -371,9 +471,11 @@ async function start(repoId, opts = {}) {
       return { ok: false, ...health, pid: child.pid, logTail: entry.buffer.slice(-40) };
     }
 
+    const servingPort = health.port || profile.port || null;
+    entry.servingPort = servingPort;
     setState(repoId, "running", { pid: child.pid, startedAt: new Date(entry.startedAt).toISOString() });
-    finishJob(jobId, "ok", `running as pid ${child.pid}${profile.port ? ` on port ${profile.port}` : ""}`);
-    return { ok: true, pid: child.pid, port: profile.port || null, healthy: health.healthy };
+    finishJob(jobId, "ok", `running as pid ${child.pid}${servingPort ? ` on port ${servingPort}` : ""}`);
+    return { ok: true, pid: child.pid, port: servingPort, healthy: health.healthy };
   } catch (err) {
     finishJob(jobId, "error", err.message);
     setState(repoId, "failed");
@@ -385,7 +487,24 @@ async function start(repoId, opts = {}) {
 async function stop(repoId) {
   const entry = supervised.get(repoId);
   setState(repoId, "stopped");
-  if (!entry || !entry.child) return { stopped: false };
+  if (!entry) return { stopped: false };
+
+  // Cancel an install that has not reached the run command yet. Without this,
+  // stopping during `npm ci` marked the repo stopped, left the entry in place,
+  // and start() went on to launch the server anyway.
+  entry.cancelled = true;
+  if (entry.installChild && entry.installChild.exitCode === null) {
+    try {
+      process.kill(-entry.installChild.pid, "SIGTERM");
+    } catch {
+      try { entry.installChild.kill("SIGTERM"); } catch { /* already gone */ }
+    }
+  }
+
+  if (!entry.child) {
+    supervised.delete(repoId);
+    return { stopped: true, phase: "install" };
+  }
 
   const pid = entry.child.pid;
   supervised.delete(repoId);
@@ -403,15 +522,24 @@ async function stop(repoId) {
   }
 
   await new Promise((r) => setTimeout(r, 2500));
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    /* exited on SIGTERM, as it should have */
+  // Only escalate if this child is genuinely still alive. Signalling -pid blind
+  // can hit an unrelated process group once the pid has been recycled.
+  if (entry.child && entry.child.exitCode === null && entry.child.signalCode === null) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      /* exited on SIGTERM, as it should have */
+    }
   }
 
   if (entry.profile && entry.profile.stop) {
-    const dir = path.resolve(git.workdirFor(repoId, db.prepare(`SELECT url FROM repos WHERE id = ?`).get(repoId).url));
-    await runOnce(entry.profile.stop, dir, entry).catch(() => {});
+    // The row can be gone already — stopping is part of removing a repository —
+    // and reading `.url` off nothing would throw out of a cleanup path.
+    const row = db.prepare(`SELECT url FROM repos WHERE id = ?`).get(repoId);
+    if (row) {
+      const dir = path.resolve(git.workdirFor(repoId, row.url));
+      await runOnce(entry.profile.stop, dir, entry).catch(() => {});
+    }
   }
 
   return { stopped: true, pid };
@@ -442,6 +570,8 @@ function status(repoId) {
     enabled: Boolean(row && row.deploy_enabled),
     autoDeploy: Boolean(row && row.auto_deploy),
     supervised: Boolean(entry),
+    // What it is really serving on, which is not always what was configured.
+    port: (entry && entry.servingPort) || (getProfile(repoId) || {}).port || null,
     profile: getProfile(repoId),
   };
 }
@@ -450,8 +580,17 @@ function logs(repoId, tail = 400) {
   const entry = supervised.get(repoId);
   if (entry) return entry.buffer.slice(-tail);
   try {
-    return fs
-      .readFileSync(logPathFor(repoId), "utf8")
+    const file = logPathFor(repoId);
+    const size = fs.statSync(file).size;
+    // Read at most the last megabyte instead of the whole file: a long-running
+    // server's log can be far larger than the handful of lines being asked for.
+    const window = Math.min(size, 1024 * 1024);
+    const handle = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(window);
+    fs.readSync(handle, buffer, 0, window, size - window);
+    fs.closeSync(handle);
+    return buffer
+      .toString("utf8")
       .split("\n")
       .slice(-tail)
       .map((text) => ({ stream: "stdout", text }));

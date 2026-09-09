@@ -12,7 +12,12 @@ enum EngineLocatorError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .nodeNotFound:
-            return "Node.js was not found. Install it (`brew install node`) or rebuild RepoDeck with --bundle-node."
+            return """
+            RepoDeck needs Node.js 22.5 or newer and could not find it.
+
+            Install it with `brew install node`, then reopen RepoDeck. If Node is \
+            installed somewhere unusual, set REPODECK_NODE to its full path.
+            """
         case .scriptNotFound:
             return "The RepoDeck engine (engine/index.js) could not be located."
         }
@@ -38,25 +43,88 @@ enum EngineLocator {
         return EngineLocation(node: node, script: script)
     }
 
+    /// The engine stores its data through `node:sqlite`, which arrived in 22.5.
+    private static let minimumNode = (major: 22, minor: 5)
+
+    /// Finds a Node the engine can actually run on.
+    ///
+    /// Taking the first node on a fixed list is not enough. A developer machine
+    /// commonly has several — Homebrew's current one, plus an older nvm or asdf
+    /// build a project pinned years ago — and picking one below 22.5 leaves the
+    /// engine with no way to open its database. So every candidate is version
+    /// checked and the first capable one wins.
+    ///
+    /// If none qualifies the newest is still returned: the engine's own error
+    /// names the version it needs, which is far more use than "Node.js was not
+    /// found" on a machine where node is plainly installed.
     private static func findNode() -> URL? {
         let fm = FileManager.default
 
+        // An explicit choice is honoured as given — including a deliberately old
+        // one, which is the only way to exercise the better-sqlite3 fallback.
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bin/node"),
            fm.isExecutableFile(atPath: bundled.path) {
             return bundled
         }
-
         if let override = ProcessInfo.processInfo.environment["REPODECK_NODE"],
            fm.isExecutableFile(atPath: override) {
             return URL(fileURLWithPath: override)
         }
 
-        for path in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
-        where fm.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
+        var candidates: [URL] = []
+        var seen = Set<String>()
+        func consider(_ url: URL?) {
+            guard let url else { return }
+            let real = url.resolvingSymlinksInPath().path
+            guard fm.isExecutableFile(atPath: url.path), seen.insert(real).inserted else { return }
+            candidates.append(url)
         }
 
-        return whichNode()
+        for path in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+            consider(URL(fileURLWithPath: path))
+        }
+        consider(whichNode())            // nvm, asdf, fnm, volta
+        guard !candidates.isEmpty else { return nil }
+
+        let versioned = candidates.map { ($0, version(of: $0)) }
+        if let capable = versioned.first(where: { supportsBuiltinSQLite($0.1) }) {
+            return capable.0
+        }
+        // Nothing qualifies. Offer the newest, so the message the user reads
+        // comes from the engine and names a version.
+        return versioned.max { lhs, rhs in (lhs.1 ?? (0, 0)) < (rhs.1 ?? (0, 0)) }?.0 ?? candidates[0]
+    }
+
+    private static func supportsBuiltinSQLite(_ v: (major: Int, minor: Int)?) -> Bool {
+        guard let v else { return false }
+        return v.major > minimumNode.major
+            || (v.major == minimumNode.major && v.minor >= minimumNode.minor)
+    }
+
+    /// `node -v`, parsed. nil when the binary will not run at all — a stale nvm
+    /// shim pointing at a deleted install is executable and still fails.
+    private static func version(of node: URL) -> (major: Int, minor: Int)? {
+        let proc = Process()
+        proc.executableURL = node
+        proc.arguments = ["-v"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0,
+              let out = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "v"))
+        else { return nil }
+        let parts = out.split(separator: ".").compactMap { Int($0) }
+        guard parts.count >= 2 else { return nil }
+        return (parts[0], parts[1])
     }
 
     private static func whichNode() -> URL? {

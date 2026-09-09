@@ -52,16 +52,51 @@ function workdirFor(repoId, url) {
 // ── credentials ──────────────────────────────────────────────────────────────
 
 /**
- * The URL actually handed to git. For HTTPS the token goes in the userinfo
- * position at call time only — origin in .git/config stays the clean URL, so a
- * token never lands on disk.
+ * The askpass helper.
+ *
+ * git needs the token, but a token passed as a git *argument* — which is what
+ * embedding it in the URL does — is readable from the process table by anything
+ * running as this user. That is not hypothetical for RepoDeck: it runs
+ * `npm install` from cloned third-party repositories as the same user, so a
+ * malicious postinstall script would only have to poll `ps` while a fetch was in
+ * flight.
+ *
+ * So the URL carries a username only, and git asks this script for the password.
+ * The token reaches it through the environment, which — unlike argv — one
+ * process cannot read from another on macOS.
+ */
+const ASKPASS_PATH = path.join(config.root, "git-askpass.sh");
+
+function ensureAskpass() {
+  const script = '#!/bin/sh\n' +
+    '# Written by RepoDeck. Hands git the credential for the current operation\n' +
+    '# without it ever appearing in a command line.\n' +
+    'printf %s "$REPODECK_GIT_PASSWORD"\n';
+  try {
+    // Rewrite only when it differs, so this is a stat on the common path.
+    if (fs.readFileSync(ASKPASS_PATH, "utf8") === script) return ASKPASS_PATH;
+  } catch {
+    // Not there yet.
+  }
+  fs.writeFileSync(ASKPASS_PATH, script, { mode: 0o700 });
+  fs.chmodSync(ASKPASS_PATH, 0o700);
+  return ASKPASS_PATH;
+}
+
+/**
+ * The URL handed to git.
+ *
+ * For token auth this carries the username `x-access-token` and no secret —
+ * GitHub, GitLab and Bitbucket all accept a PAT as the password for that user.
+ * The password itself travels via GIT_ASKPASS. `origin` in .git/config stays the
+ * clean URL either way, so nothing lands on disk.
  */
 function authedUrl(creds) {
   if (creds.auth_type !== "token" || !creds.credential_ref) return creds.url;
-  const token = secrets.require(creds.credential_ref, "The git credential for this repository");
+  if (!creds.url.startsWith("http")) return creds.url;
   const u = new URL(creds.url);
-  u.username = encodeURIComponent(token);
-  u.password = "x-oauth-basic";
+  u.username = "x-access-token";
+  u.password = "";
   return u.toString();
 }
 
@@ -73,10 +108,24 @@ function gitEnv(creds) {
   for (const k of ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL", "PAGER", "GIT_PAGER", "LESS"]) {
     delete e[k];
   }
+
+  if (creds.auth_type === "token" && creds.credential_ref) {
+    const token = secrets.require(creds.credential_ref, "The git credential for this repository");
+    e.GIT_ASKPASS = ensureAskpass();
+    e.REPODECK_GIT_PASSWORD = token;
+    // Belt and braces: if anything still tries an interactive prompt, fail fast
+    // rather than hang, and never fall back to a system credential store.
+    e.GIT_CONFIG_NOSYSTEM = "1";
+  }
+
   if (creds.auth_type === "ssh") {
     const key = creds.credential_ref ? secrets.get(creds.credential_ref) : null;
     if (key) {
-      e.GIT_SSH_COMMAND = `ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+      // The key is a path, not a secret, but quote it so a path with a space or
+      // a shell metacharacter cannot change the command git runs.
+      e.GIT_SSH_COMMAND =
+        `ssh -i '${String(key).replace(/'/g, "'\\''")}' ` +
+        `-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
     }
   }
   return e;
@@ -183,12 +232,31 @@ async function aheadCount(dir, creds, branch) {
  */
 async function worktreeState(dir, creds, branch) {
   const g = git(dir, creds);
-  const porcelain = await g.raw(["status", "--porcelain=v1", "--untracked-files=normal"]);
-  const dirtyFiles = porcelain
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((l) => ({ code: l.slice(0, 2).trim(), path: l.slice(3) }));
+  const porcelain = await g.raw([
+    "-c",
+    "core.quotePath=false",
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=normal",
+    "-z",
+  ]);
+  // Porcelain v1 is fixed-width: two status characters, a space, then the path.
+  // Trimming the line first shifts a single-character code (" M file.txt") left by
+  // one, so slice(3) then ate the first letter of the filename. -z also keeps a
+  // filename containing a newline in one piece and stops git quoting non-ASCII
+  // names.
+  //
+  // One wrinkle: with -z a rename entry is TWO NUL-terminated fields, the new
+  // path then the old one. The second has no status prefix, so it is skipped.
+  const dirtyFiles = [];
+  const records = porcelain.split("\0").filter(Boolean);
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.length < 4 || record[2] !== " ") continue; // the trailing half of a rename
+    const code = record.slice(0, 2).trim();
+    dirtyFiles.push({ code, path: record.slice(3) });
+    if (code[0] === "R" || code[0] === "C") i++; // consume the original path
+  }
 
   const ahead = await aheadCount(dir, creds, branch);
   const behind = await behindCount(dir, creds, branch);
@@ -222,13 +290,52 @@ async function applyUpdate(dir, creds, branch, strategy) {
   const target = `refs/remotes/origin/${branch}`;
 
   if (strategy === "reset") {
+    // `checkout -B` force-moves the branch to the target, so any commit on it
+    // that origin does not have is gone. The caller checks the CHECKED-OUT
+    // branch, which is not necessarily this one — a clone left on some other
+    // branch would have had `branch` silently rewound. Check the branch we are
+    // about to move, not the one that happens to be current.
+    const unpushed = await g
+      .raw(["rev-list", "--count", `${target}..refs/heads/${branch}`])
+      .then((n) => Number(n.trim()) || 0)
+      .catch(() => 0);
+    if (unpushed > 0) {
+      return {
+        ok: false,
+        strategy: "reset",
+        conflicts: [],
+        refused: `refusing to reset ${branch}: it has ${unpushed} commit(s) origin does not have`,
+      };
+    }
     await g.raw(["checkout", "-f", "-B", branch, target]);
     await g.raw(["reset", "--hard", target]);
     await g.raw(["clean", "-fd"]);
     return { ok: true, strategy: "reset", conflicts: [] };
   }
 
-  await g.raw(["checkout", "-B", branch]).catch(() => {});
+  // Start-point matters: a bare `checkout -B <branch>` resets the branch to the
+  // CURRENT HEAD, which drops its commits when HEAD is somewhere else. Move onto
+  // the branch without moving the branch.
+  // The `--` matters. Without it, `git checkout develop` in a repository that
+  // has a `develop/` DIRECTORY but no local `develop` BRANCH is a pathspec
+  // checkout: it exits 0, throws away uncommitted work under that directory,
+  // and leaves HEAD where it was — so the merge below lands on the wrong branch
+  // and the whole thing is reported as a successful pull.
+  await g.raw(["checkout", branch, "--"]).catch(async () => {
+    // It may not exist locally yet; create it on the remote-tracking tip.
+    await g.raw(["checkout", "-B", branch, target]);
+  });
+
+  // Verify rather than assume: every path above has a way to leave HEAD behind.
+  const head = await g.raw(["rev-parse", "--abbrev-ref", "HEAD"]).then((s) => s.trim(), () => "");
+  if (head !== branch) {
+    return {
+      ok: false,
+      strategy: "merge",
+      conflicts: [],
+      refused: `Could not switch to ${branch} — the working tree is on ${head || "an unknown ref"}.`,
+    };
+  }
 
   // Whether the merge "failed" is decided by looking at the index, not by
   // whether the git wrapper raised. A conflicted merge exits non-zero, but a
@@ -252,21 +359,101 @@ async function applyUpdate(dir, creds, branch, strategy) {
   return { ok: true, strategy: "merge", conflicts: [] };
 }
 
+/**
+ * Paths git reports as conflicted.
+ *
+ * NUL-delimited and with quoting off. By default git C-quotes any path with a
+ * non-ASCII byte in it — `café.js` comes back as the literal 12-character
+ * string `"caf\303\251.js"`, quotes and all — and every consumer then works on
+ * a string that is not a path: reading its stages fails, the mode check finds
+ * nothing, and writing a resolution creates a junk file beside the real one.
+ * Splitting on newlines is wrong for the same reason a filename may contain one.
+ */
 async function conflictedPaths(dir, creds) {
-  const out = await git(dir, creds).raw(["diff", "--name-only", "--diff-filter=U"]).catch(() => "");
-  return out.split("\n").map((l) => l.trim()).filter(Boolean);
+  const out = await git(dir, creds)
+    .raw(["-c", "core.quotePath=false", "diff", "--name-only", "--diff-filter=U", "-z"])
+    .catch(() => "");
+  return out.split("\0").filter(Boolean);
+}
+
+/**
+ * Paths that were conflicted in this merge and have since been staged.
+ *
+ * Staging a resolution removes the path from the conflicted list, so a retry
+ * after a partial failure cannot tell "already dealt with" apart from "never
+ * conflicted at all". During a merge the paths git has staged are exactly the
+ * ones that differ from MERGE_HEAD in the index but are no longer unmerged.
+ */
+async function resolvedPaths(dir, creds) {
+  const g = git(dir, creds);
+  const mergeHead = await g.raw(["rev-parse", "--verify", "MERGE_HEAD"]).then(
+    (s) => s.trim(),
+    () => null,
+  );
+  if (!mergeHead) return [];
+  const unmerged = new Set(await conflictedPaths(dir, creds));
+  const nulSplit = (s) => s.split("\0").filter(Boolean);
+  const diffAgainst = (ref) =>
+    g
+      .raw(["-c", "core.quotePath=false", "diff", "--name-only", "--cached", "-z", ref])
+      .then(nulSplit, () => []);
+
+  // Against BOTH parents. A file the merge auto-merged cleanly differs from HEAD
+  // too, so comparing with HEAD alone returned every merged file and widened the
+  // caller's write allowlist far past the conflicted set. A path that differs
+  // from both sides is one somebody wrote a resolution for.
+  const [vsHead, vsMergeHead] = await Promise.all([diffAgainst("HEAD"), diffAgainst(mergeHead)]);
+  const alsoVsMergeHead = new Set(vsMergeHead);
+  return vsHead.filter((p) => alsoVsMergeHead.has(p) && !unmerged.has(p));
+}
+
+/**
+ * The index mode of a conflicted path, as a string like "100644".
+ *
+ * Used to refuse anything that is not an ordinary file. A conflicted symlink
+ * passes a "git says this path is conflicted" check and then makes the write
+ * follow the link — landing the content wherever the link points, which can be
+ * outside the repository entirely. Gitlinks (submodules) are equally not ours
+ * to write.
+ */
+async function conflictModes(dir, creds, filePath) {
+  // No .catch here: the caller treats an empty result as "refuse", so a genuine
+  // error has to be distinguishable from "git knows of no stages for this path".
+  const out = await git(dir, creds).raw([
+    "-c",
+    "core.quotePath=false",
+    "ls-files",
+    "-u",
+    "-z",
+    "--",
+    filePath,
+  ]);
+  const modes = new Set();
+  for (const record of out.split("\0")) {
+    const m = record.match(/^(\d{6})\s/);
+    if (m) modes.add(m[1]);
+  }
+  return [...modes];
 }
 
 /** The three sides of one conflicted file, for a human or a model to reconcile. */
 async function conflictSides(dir, creds, filePath) {
   const g = git(dir, creds);
+  // Distinguish "this stage is an empty file" from "this stage does not exist".
+  // Both come back as "" otherwise, and a delete/modify conflict then looks like
+  // a file whose content is empty.
   const read = async (stage) =>
-    g.raw(["show", `:${stage}:${filePath}`]).catch(() => "");
+    g.raw(["show", `:${stage}:${filePath}`]).then(
+      (text) => ({ present: true, text }),
+      () => ({ present: false, text: "" }),
+    );
+  const [base, ours, theirs] = await Promise.all([read(1), read(2), read(3)]);
   return {
     path: filePath,
-    base: await read(1),
-    ours: await read(2),
-    theirs: await read(3),
+    stages: { base: base.present, ours: ours.present, theirs: theirs.present },
+    base: base.text,
+    ours: ours.text,
+    theirs: theirs.text,
     merged: fs.existsSync(path.join(dir, filePath))
       ? fs.readFileSync(path.join(dir, filePath), "utf8")
       : "",
@@ -274,8 +461,36 @@ async function conflictSides(dir, creds, filePath) {
 }
 
 async function stageResolved(dir, creds, filePath, contents) {
-  fs.writeFileSync(path.join(dir, filePath), contents, "utf8");
+  // path.join happily walks out of the directory with enough "..", so resolve
+  // and check containment before writing. The caller validates too; this is the
+  // check that has to hold even if a future caller forgets.
+  const root = path.resolve(dir);
+  const target = path.resolve(root, filePath);
+  if (target !== root && !target.startsWith(root + path.sep)) {
+    throw new Error(`Refusing to write outside the repository: ${filePath}`);
+  }
+
+  // Containment is not enough on its own. If the path is a symlink, writing
+  // through it puts the content wherever it points — which may be outside the
+  // repository, and the containment check above would never have seen it.
+  let existing = null;
+  try {
+    existing = fs.lstatSync(target);
+  } catch {
+    /* a new file is fine */
+  }
+  if (existing && !existing.isFile()) {
+    throw new Error(
+      `Refusing to write ${filePath}: it is a ${existing.isSymbolicLink() ? "symlink" : "special file"}, not a regular file.`,
+    );
+  }
+
+  fs.writeFileSync(target, contents, "utf8");
   await git(dir, creds).raw(["add", "--", filePath]);
+  // Re-materialise through git so eol and clean/smudge filters apply. Without
+  // this a repository with `* text=auto` ends up with a working tree whose line
+  // endings differ from a fresh checkout, and the very next status is dirty.
+  await git(dir, creds).raw(["checkout", "--", filePath]).catch(() => {});
 }
 
 async function commitMerge(dir, creds, message) {
@@ -361,8 +576,15 @@ function parseNumstat(out) {
     .map(([a, d, p]) => ({
       additions: a === "-" ? 0 : Number(a) || 0, // "-" means binary
       deletions: d === "-" ? 0 : Number(d) || 0,
+      // git writes a rename as `src/{old => new}/file.js` or `old => new`. The
+      // first form has a prefix and a suffix outside the braces; replacing the
+      // whole line with the brace contents dropped both, yielding a path that
+      // does not exist in the repository.
       path: p.includes("=>")
-        ? p.replace(/.*\{(.*) => (.*)\}.*/, (_m, _o, n) => n).replace(/^.*=> /, "").replace(/[{}]/g, "")
+        ? p
+            .replace(/^(.*)\{(.*) => (.*)\}(.*)$/, (_m, pre, _old, next, post) => `${pre}${next}${post}`)
+            .replace(/^.* => /, "")
+            .replace(/\/{2,}/g, "/")
         : p,
     }));
 }
@@ -406,7 +628,9 @@ async function commitsInMerge(dir, creds, sha) {
 /** Per-file added/removed counts for one commit or merge. */
 async function filesInMerge(dir, creds, sha) {
   const out = await git(dir, creds)
-    .raw(["show", "--numstat", "--format=", "--first-parent", "-m", sha])
+    // --no-renames, to match listMergeCommits. With detection on, git emits the
+    // `{old => new}` form and the two callers disagreed about what a path is.
+    .raw(["show", "--numstat", "--no-renames", "--format=", "--first-parent", "-m", sha])
     .catch(() => "");
   return parseNumstat(out);
 }
@@ -418,7 +642,7 @@ async function filesInMerge(dir, creds, sha) {
  * diff is what lets it say "the retry now backs off exponentially" instead of
  * "fixed retries".
  */
-async function patchForMerge(dir, creds, sha, maxChars = 60_000) {
+async function patchForMerge(dir, creds, sha, maxChars = 400_000) {
   const g = git(dir, creds);
   const parents = (await g.raw(["rev-list", "--parents", "-n", "1", sha]).catch(() => "")).trim().split(/\s+/);
   const args = parents.length >= 3
@@ -461,6 +685,8 @@ module.exports = {
   worktreeState,
   applyUpdate,
   conflictedPaths,
+  resolvedPaths,
+  conflictModes,
   conflictSides,
   stageResolved,
   commitMerge,

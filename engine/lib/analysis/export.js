@@ -15,6 +15,11 @@ const { readKnowledgeGraph } = require("./knowledge");
 
 const BUNDLE_VERSION = 1;
 
+/** A YAML double-quoted scalar, safe for arbitrary prose. */
+function yamlScalar(text) {
+  return `"${String(text).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function slug(s) {
   return String(s || "")
     .toLowerCase()
@@ -26,10 +31,30 @@ function bullets(items, prefix = "- ") {
   return (items || []).filter(Boolean).map((i) => `${prefix}${i}`).join("\n");
 }
 
+/**
+ * One table cell, safe for arbitrary model- and repository-derived text.
+ *
+ * A pipe inside a TypeScript union (`string | null` — extremely common in a
+ * field type) closes the column early, so every row after it in the table is
+ * mis-aligned and the document an agent reads becomes unparseable nonsense
+ * exactly where the type information is.
+ */
+function cell(text) {
+  return String(text ?? "")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ")
+    .trim();
+}
+
+/** Repository text inside a code span. A backtick in it would close the span. */
+function code(text) {
+  return String(text ?? "").replace(/`/g, "'");
+}
+
 function fieldTable(fields) {
   if (!fields || fields.length === 0) return "_none declared in source_";
   const rows = fields.map(
-    (f) => `| \`${f.name}\` | ${f.type || "?"} | ${f.required ? "yes" : "no"} | ${f.note || ""} |`,
+    (f) => `| \`${code(f.name)}\` | ${cell(f.type) || "?"} | ${f.required ? "yes" : "no"} | ${cell(f.note)} |`,
   );
   return ["| Field | Type | Required | Notes |", "| --- | --- | --- | --- |", ...rows].join("\n");
 }
@@ -153,7 +178,18 @@ function renderClaudeMd(kg) {
   if (kg.entities.length) {
     out.push("## Data model");
     out.push("");
-    out.push(bullets(kg.entities.map((e) => `**${e.name}**${e.store ? ` (\`${e.store}\`)` : ""} — ${e.summary || ""}`)));
+    // CLAUDE.md is loaded into every agent's context, so it is capped like every
+    // other section here; data-model.md carries the full list.
+    out.push(
+      bullets(
+        kg.entities
+          .slice(0, 40)
+          .map((e) => `**${e.name}**${e.store ? ` (\`${code(e.store)}\`)` : ""} — ${cell(e.summary)}`),
+      ),
+    );
+    if (kg.entities.length > 40) {
+      out.push("", `_…and ${kg.entities.length - 40} more — see \`data-model.md\`._`);
+    }
     out.push("");
     out.push("Field-level detail in `data-model.md`.");
     out.push("");
@@ -182,7 +218,9 @@ function renderClaudeMd(kg) {
       bullets(
         kg.hotspots
           .slice(0, 15)
-          .map((h) => `\`${h.path}\` — ${h.role || h.layer} (${h.commit_count} merges, ${h.churn} lines)`),
+          // readKnowledgeGraph aliases commit_count to `merges`; reading the raw
+          // column name here printed "undefined merges" in every exported CLAUDE.md.
+          .map((h) => `\`${h.path}\` — ${h.role || h.layer} (${h.merges ?? 0} merges, ${h.churn} lines)`),
       ),
     );
     out.push("");
@@ -242,7 +280,7 @@ function renderClaudeMd(kg) {
     );
     out.push("");
     for (const e of kg.errors.slice(0, 15)) {
-      out.push(`- \`${e.label}\` — \`${e.path}:${e.line}\`${e.meaning ? ` · ${e.meaning}` : ""}`);
+      out.push(`- \`${code(e.label)}\` — \`${code(e.path)}:${e.line}\`${e.meaning ? ` · ${cell(e.meaning)}` : ""}`);
     }
     out.push("");
   }
@@ -414,7 +452,9 @@ function renderAgent(kg, m) {
   const front = [
     "---",
     `name: ${slug(kg.repo.name)}-${slug(m.module)}`,
-    `description: Works on the ${m.module} module of ${kg.repo.name}. ${(m.what || "").replace(/\n/g, " ").slice(0, 160)}`,
+    // Quoted and escaped: an unquoted YAML scalar containing ": " or a leading
+    // "#" makes the whole agent file unparseable, and this text is model prose.
+    `description: ${yamlScalar(`Works on the ${m.module} module of ${kg.repo.name}. ${(m.what || "").replace(/\s+/g, " ").slice(0, 160)}`)}`,
     "tools: Read, Edit, Write, Grep, Glob, Bash",
     "---",
     "",
@@ -490,7 +530,7 @@ function renderAgent(kg, m) {
       bullets(
         moduleErrors
           .slice(0, 20)
-          .map((e) => `\`${e.label}\` — \`${e.path}:${e.line}\`${e.meaning ? ` · ${e.meaning}` : ""}`),
+          .map((e) => `\`${code(e.label)}\` — \`${code(e.path)}:${e.line}\`${e.meaning ? ` · ${cell(e.meaning)}` : ""}`),
       ),
     );
     body.push("");
@@ -619,7 +659,10 @@ function renderErrors(kg) {
   for (const [module, errors] of byModule) {
     out.push(`## ${module}`, "");
     for (const e of errors) {
-      out.push(`### \`${e.label}\``, "");
+      // The label is lifted verbatim from someone else's source file. A backtick
+      // in it would close the code span and let repository content become prose
+      // in a document an agent reads as instructions.
+      out.push(`### \`${code(e.label)}\``, "");
       out.push(`- Raised at \`${e.path}:${e.line}\`${e.symbol ? ` in \`${e.symbol}()\`` : ""} (${e.kind})`);
       if (e.meaning) out.push(`- ${e.meaning}`);
       if (e.evidence) out.push(`- Source: \`${e.evidence.replace(/\`/g, "'")}\``);
@@ -777,9 +820,18 @@ function exportBundle(repoId, opts = {}) {
   const kg = readKnowledgeGraph(repoId);
   const graph = graphExport(repoId);
   const callGraph = callGraphExport(repoId);
+  // Keyed on the repo id as well as the name. `slug(name)` is the last URL
+  // segment, so acme/api and beta/api both resolved to "api-knowledge-graph"
+  // and the second export overwrote the first.
   const dest =
-    opts.dest || path.join(config.exportDir, `${slug(kg.repo.name)}-knowledge-graph`);
+    opts.dest || path.join(config.exportDir, `${repoId}-${slug(kg.repo.name)}-knowledge-graph`);
 
+  // Clear the generated subtrees first. Exporting into a directory a previous
+  // run used left briefs and installed subagents for modules that no longer
+  // exist — the stale-documentation failure this bundle is meant to prevent.
+  for (const generated of ["modules", "agents"]) {
+    fs.rmSync(path.join(dest, generated), { recursive: true, force: true });
+  }
   fs.mkdirSync(path.join(dest, "modules"), { recursive: true });
   const written = [];
   const write = (rel, body) => {
@@ -810,9 +862,19 @@ function exportBundle(repoId, opts = {}) {
   write("graph.json", JSON.stringify(graph, null, 2));
   write("call-graph.json", JSON.stringify(callGraph, null, 2));
 
+  // Two module names can normalise to the same slug ("API v2" and "api-v2"),
+  // and the second silently overwrote the first while the manifest listed both.
+  const usedNames = new Set();
   for (const m of kg.modules) {
-    write(path.join("modules", `${slug(m.module)}.md`), renderModule(m));
-    if (opts.agents !== false) write(path.join("agents", `${slug(m.module)}.md`), renderAgent(kg, m));
+    let base = slug(m.module) || "module";
+    if (usedNames.has(base)) {
+      let n = 2;
+      while (usedNames.has(`${base}-${n}`)) n++;
+      base = `${base}-${n}`;
+    }
+    usedNames.add(base);
+    write(path.join("modules", `${base}.md`), renderModule(m));
+    if (opts.agents !== false) write(path.join("agents", `${base}.md`), renderAgent(kg, m));
   }
 
   write(

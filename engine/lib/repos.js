@@ -145,6 +145,11 @@ async function inspectRemote({ url, authType = "none", credentialRef = null }) {
     try {
       const info = await github.getRepo(token, remote.owner, remote.name);
       const branches = await github.listBranchNames(token, remote.owner, remote.name);
+      if (branches.length === 0) {
+        throw new Error(
+          "That repository has no commits yet, so there is nothing to index. Push something to it first.",
+        );
+      }
       return {
         ...remote,
         branches,
@@ -160,6 +165,16 @@ async function inspectRemote({ url, authType = "none", credentialRef = null }) {
   }
 
   const { branches, head } = await git.listBranches(creds);
+  if (branches.length === 0) {
+    // A repository with no commits has no branches to clone, and git's own
+    // message for that ("Remote branch main not found in upstream origin",
+    // wrapped in a clone progress dump) is not something a user can act on.
+    // Refuse here, before a row is written — otherwise a failed add leaves a
+    // permanently broken entry that only a manual remove clears.
+    throw new Error(
+      "That repository has no commits yet, so there is nothing to index. Push something to it first.",
+    );
+  }
   return { ...remote, branches, suggested: head, private: null, via: "git" };
 }
 

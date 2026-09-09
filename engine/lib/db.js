@@ -166,6 +166,11 @@ CREATE TABLE IF NOT EXISTS symbol_edges (
   UNIQUE (repo_id, src_id, dst_id, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_edges_repo ON symbol_edges(repo_id);
+-- The per-index degree recompute runs a correlated subquery per symbol against
+-- both endpoints. Without these it is a full scan of the edge table per symbol,
+-- which is quadratic on a repository of any size.
+CREATE INDEX IF NOT EXISTS idx_symbol_edges_src ON symbol_edges(src_id);
+CREATE INDEX IF NOT EXISTS idx_symbol_edges_dst ON symbol_edges(dst_id);
 
 -- ── pull request digests ────────────────────────────────────────────────────
 -- One plain-language summary per merged PR (or per merge commit when there is
@@ -380,6 +385,13 @@ CREATE TABLE IF NOT EXISTS settings (
 /** Additive column migrations. Safe to re-run on every boot. */
 const migrations = [
   // [table, sql] — add new columns here rather than editing the CREATE above.
+
+  // A fingerprint of the source the model described. Without it, a function
+  // contract written months ago was never re-derived while the name survived,
+  // so the exported graph asserted behaviour for an implementation that had
+  // since been rewritten — the most expensive kind of wrong, because an agent
+  // reads it as fact.
+  ["symbols", `ALTER TABLE symbols ADD COLUMN source_sha TEXT`],
 ];
 for (const [table, sql] of migrations) {
   const col = sql.split("ADD COLUMN ")[1].split(" ")[0];

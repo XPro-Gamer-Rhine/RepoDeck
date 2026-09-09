@@ -94,7 +94,7 @@ function traceFrom(entry, edgesBySrc, symbolsById) {
 function buildFlows(repoId) {
   const symbols = db
     .prepare(
-      `SELECT s.id, s.path, s.name, s.kind, s.line, s.in_degree, f.layer, f.module
+      `SELECT s.id, s.path, s.name, s.kind, s.line, s.in_degree, s.out_degree, f.layer, f.module
        FROM symbols s
        JOIN files f ON f.repo_id = s.repo_id AND f.path = s.path
        WHERE s.repo_id = ? AND s.deleted = 0 AND f.deleted = 0`,

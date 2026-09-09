@@ -17,6 +17,7 @@ struct GraphCanvasView: View {
     @State private var offset: CGSize = .zero
     @State private var dragStartOffset: CGSize = .zero
     @State private var hoverIndex: Int?
+    @State private var edgeColorStore = EdgeColorCache()
     @State private var hoverPoint: CGPoint?
     @State private var draggingIndex: Int?
     @State private var searchText = ""
@@ -57,8 +58,10 @@ struct GraphCanvasView: View {
                         viewportSize = newValue
                         layout.bounds = CGRect(origin: .zero, size: newValue)
                     }
-                    .onChange(of: detail.graph.nodes.count) { _, _ in reload() }
-                    .onChange(of: detail.graph.grouping) { _, _ in reload() }
+                    // Comparing counts missed a re-index that produced the same
+                    // number of nodes, leaving the previous graph's positions under
+                    // the new one's labels.
+                    .onChange(of: graphIdentity) { _, _ in reload() }
                     // Fitting at load time frames the seed spiral, not the graph.
                     // The useful moment is when the forces stop moving things.
                     .onChange(of: layout.isSettling) { _, settling in
@@ -72,7 +75,12 @@ struct GraphCanvasView: View {
     }
 
     @ViewBuilder private var emptyState: some View {
-        if detail.graph.meta.visibleFiles == 0 && detail.minHeat == 0 && detail.hiddenLayers.isEmpty {
+        // hideTests defaults to true, so a repository of nothing but tests was
+        // reported as "nothing indexed at all".
+        if detail.graph.meta.visibleFiles == 0
+            && detail.minHeat == 0
+            && detail.hiddenLayers.isEmpty
+            && !detail.hideTests {
             EmptyStateView(
                 title: "Nothing indexed yet",
                 message: "Run an index and the architecture graph appears here — every file, the imports between them, and a heat channel showing what is changing now.",
@@ -257,10 +265,18 @@ struct GraphCanvasView: View {
             }
         }
         .onTapGesture { point in
-            let index = hitTest(at: point)
-            Task { await detail.select(node: index.map { layout.nodes[$0] }) }
+            // Resolve the node NOW, not inside the Task. A reload between the click
+            // and the task body would leave the index past the end of a shorter
+            // array, which traps.
+            guard let index = hitTest(at: point), layout.nodes.indices.contains(index) else {
+                Task { await detail.select(node: nil) }
+                return
+            }
+            let node = layout.nodes[index]
+            Task { await detail.select(node: node) }
         }
         .modifier(ScrollZoom(scale: $scale, offset: $offset, onManualZoom: { userFramedTheView = true }))
+        .onDisappear { releaseDrag() }
         .overlay(alignment: .topLeading) { tooltip }
         .overlay(alignment: .bottomTrailing) { scaleBadge }
     }
@@ -276,9 +292,12 @@ struct GraphCanvasView: View {
 
         // Painter's algorithm: furthest first, so near nodes occlude far ones.
         // In 2D every depth is zero and this collapses to the original order.
-        let drawOrder = layout.mode == .orbit
+        // Only the 3D view needs an explicit order. In 2D every depth is zero, so
+        // materialising an index array per frame just to iterate it in order was
+        // an allocation the size of the graph, sixty times a second.
+        let drawOrder: [Int]? = layout.mode == .orbit
             ? nodes.indices.sorted { projected[$0].depth > projected[$1].depth }
-            : Array(nodes.indices)
+            : nil
 
         // ── edges ────────────────────────────────────────────────────────────
         // Drawn first and never over a node: at this density an edge crossing a
@@ -288,7 +307,26 @@ struct GraphCanvasView: View {
         // answer — where does a request go? — is a question about direction. The
         // line stops at the target's edge and an arrowhead sits there; a bare
         // line would leave the reader guessing which way the call runs.
+        // Hoisted out of the loop. `detail` is an observed object, so each access
+        // inside the body was a property read on top of the set hashing — and on
+        // the overwhelmingly common path nothing is hidden at all, which the
+        // isEmpty check settles once instead of twice per edge.
+        let hiddenLayers = detail.hiddenLayers
+        let anyHidden = !hiddenLayers.isEmpty
+
+        // Edge colour is a function of the source node's hue, which changes only
+        // when the colour mode or the graph does — not once per edge per frame,
+        // which is what deriving it in the loop amounted to.
+        let edgeColors = edgeColorCache(dark: dark)
+
         for link in layout.links {
+            // An edge whose endpoint the legend has hidden was still drawn, leaving
+            // arrows pointing at empty space.
+            if anyHidden,
+               hiddenLayers.contains(nodes[link.a].layer) || hiddenLayers.contains(nodes[link.b].layer) {
+                continue
+            }
+
             let dimmed = focus != nil && !(focus!.contains(link.a) && focus!.contains(link.b))
             if dimmed && scale < 0.55 { continue } // too small to read anyway
 
@@ -320,9 +358,8 @@ struct GraphCanvasView: View {
             path.move(to: from)
             path.addQuadCurve(to: head, control: control)
 
-            let (hue, _) = hueSaturation(for: nodes[link.a])
-            var color = GraphPalette.edgeColor(hue: hue, inferred: link.inferred, dark: dark)
-                .opacity(depthOpacity(edgeDepth))
+            let base = link.inferred ? edgeColors.inferred[link.a] : edgeColors.solid[link.a]
+            var color = base.opacity(depthOpacity(edgeDepth))
             if dimmed { color = color.opacity(0.06) }
 
             let width = max(0.5, (link.semantic ? 1.5 : 0.9) * scale)
@@ -355,7 +392,11 @@ struct GraphCanvasView: View {
         }
 
         // ── nodes ────────────────────────────────────────────────────────────
-        for i in drawOrder {
+        for k in nodes.indices {
+            // `drawOrder` is nil in 2D, where the natural order is already
+            // correct. Indexing through it costs one optional check per node and
+            // no allocation; wrapping it in a sequence would box every step.
+            let i = drawOrder?[k] ?? k
             let node = nodes[i]
             if detail.hiddenLayers.contains(node.layer) { continue }
 
@@ -413,14 +454,28 @@ struct GraphCanvasView: View {
         var claimed: [CGRect] = []
         claimed.reserveCapacity(48)
 
-        let ordered = nodes.indices.sorted { a, b in
-            labelPriority(nodes[a], index: a, matches: matches) > labelPriority(nodes[b], index: b, matches: matches)
+        // Ordering labels used to sort every index with a comparator that
+        // recomputed both scores on each comparison — 2n log n score evaluations
+        // per frame, each doing a set lookup and an optional-string compare. Score
+        // once, then sort the scores; and since at most ~70 labels are ever drawn,
+        // only the top slice needs to be in order.
+        let selectedID = detail.selectedNode?.id
+        let hidden = detail.hiddenLayers
+        var scored: [(index: Int, score: Double)] = []
+        scored.reserveCapacity(nodes.count)
+        for i in nodes.indices {
+            if !hidden.isEmpty && hidden.contains(nodes[i].layer) { continue }
+            var score = Double(nodes[i].degree) + nodes[i].heat * 6
+            if matches.contains(i) { score += 1000 }
+            if nodes[i].id == selectedID { score += 2000 }
+            if hoverIndex == i { score += 3000 }
+            scored.append((i, score))
         }
+        scored.sort { $0.score > $1.score }
 
-        for i in ordered {
+        for (i, _) in scored {
             let node = nodes[i]
-            if detail.hiddenLayers.contains(node.layer) { continue }
-            let isFocused = hoverIndex == i || detail.selectedNode?.id == node.id || matches.contains(i)
+            let isFocused = hoverIndex == i || node.id == selectedID || matches.contains(i)
             if let focus, !focus.contains(i), !isFocused { continue }
             if claimed.count > 70 && !isFocused { break }
 
@@ -485,7 +540,7 @@ struct GraphCanvasView: View {
 
     private func projectAll() -> [Projected] {
         let count = layout.nodes.count
-        guard count > 0 else { return [] }
+        guard count > 0, layout.radius.count >= count else { return [] }
 
         if layout.mode != .orbit {
             return (0..<count).map { i in
@@ -498,8 +553,9 @@ struct GraphCanvasView: View {
             }
         }
 
-        let centre = layout.contentCentre()
-        let radius = layout.contentRadius()
+        let bounds = layout.cloudBounds()
+        let centre = bounds.centre
+        let radius = bounds.radius
         // Camera far enough back that the cloud fills the frame without the
         // near nodes ballooning; 2.6 radii is the value that looked right across
         // graphs from thirty nodes to two thousand.
@@ -539,6 +595,7 @@ struct GraphCanvasView: View {
 
         let span = max(1, furthest - nearest)
         for (i, (point, viewZ, k)) in raw.enumerated() {
+            let nodeRadius = i < layout.radius.count ? layout.radius[i] : 0
             out.append(
                 Projected(
                     point: CGPoint(
@@ -547,7 +604,7 @@ struct GraphCanvasView: View {
                     ),
                     // Degree still sets the base size — perspective only modulates
                     // it, so a hub stays a hub wherever it happens to be standing.
-                    radius: max(0.6, layout.radius[i] * scale * k),
+                    radius: max(0.6, nodeRadius * scale * k),
                     depth: (viewZ - nearest) / span,
                     visible: true
                 )
@@ -560,6 +617,55 @@ struct GraphCanvasView: View {
     /// once everything is the same colour.
     private func depthOpacity(_ depth: Double) -> Double {
         layout.mode == .orbit ? 1.0 - 0.62 * depth : 1.0
+    }
+
+    /// Where a screen point lands in graph space, for the node being dragged.
+    ///
+    /// In 2D this is the plain inverse of pan and zoom. In 3D a screen point is a
+    /// ray, not a point, so the node moves on the viewer-facing plane through its
+    /// own depth — the only reading of a flat drag that keeps the node under the
+    /// pointer.
+    private func graphPoint(from screen: CGPoint, forNode index: Int) -> CGPoint {
+        guard layout.mode == .orbit,
+              layout.depth.indices.contains(index),
+              layout.position.indices.contains(index)
+        else { return toGraph(screen) }
+
+        let bounds = layout.cloudBounds()
+        let cameraDistance = bounds.radius * 2.6
+        let cosYaw = cos(yaw), sinYaw = sin(yaw)
+        let cosPitch = cos(pitch), sinPitch = sin(pitch)
+
+        // Forward-project the node to recover the perspective factor it is drawn at.
+        let x = layout.position[index].x - bounds.centre.x
+        let y = layout.position[index].y - bounds.centre.y
+        let z = layout.depth[index] - bounds.centre.z
+        let z1 = -x * sinYaw + z * cosYaw
+        let z2 = y * sinPitch + z1 * cosPitch
+        let k = cameraDistance / max(cameraDistance * 0.25, z2 + cameraDistance)
+
+        // Undo pan, zoom and that factor to get rotated view coordinates.
+        let vx = (Double(screen.x) - Double(offset.width)) / Double(scale) / k
+        let vy = (Double(screen.y) - Double(offset.height)) / Double(scale) / k
+
+        // Then undo the rotation, holding this node's depth constant.
+        let y1 = vy * cosPitch + z2 * sinPitch
+        let worldX = vx * cosYaw - z1 * sinYaw
+        return CGPoint(x: worldX + bounds.centre.x, y: y1 + bounds.centre.y)
+    }
+
+    /// Ends a drag. Also called when the canvas disappears: a gesture cancelled by
+    /// a window change never delivers onEnded, and the node stayed pinned,
+    /// hijacking every later drag.
+    private func releaseDrag() {
+        if let index = draggingIndex, index >= 0 { layout.unpin(index) }
+        draggingIndex = nil
+    }
+
+    /// Cheap identity for "is this a different graph?".
+    private var graphIdentity: String {
+        let nodes = detail.graph.nodes
+        return "\(detail.graph.grouping)|\(nodes.count)|\(nodes.first?.id ?? "")|\(nodes.last?.id ?? "")"
     }
 
     private func normalize(_ p: CGPoint) -> CGPoint {
@@ -666,17 +772,53 @@ struct GraphCanvasView: View {
         return set
     }
 
+    /// Indices whose path, module or role contain the search text.
+    ///
+    /// Called from the draw path, so it runs on every frame of the simulation —
+    /// with three `lowercased()` allocations per node it was the single largest
+    /// source of per-frame garbage on a large graph. The lowercased haystack is
+    /// built once per node when the layout loads; this only scans it.
     private func searchMatches() -> Set<Int> {
         let needle = searchText.trimmingCharacters(in: .whitespaces).lowercased()
         guard needle.count >= 2 else { return [] }
         var out = Set<Int>()
-        for (i, node) in layout.nodes.enumerated()
-        where node.path.lowercased().contains(needle)
-            || (node.module ?? "").lowercased().contains(needle)
-            || (node.role ?? "").lowercased().contains(needle) {
-            out.insert(i)
-        }
+        let keys = layout.searchKeys
+        guard keys.count == layout.nodes.count else { return [] }
+        for i in keys.indices where keys[i].contains(needle) { out.insert(i) }
         return out
+    }
+
+    /// Per-node edge colours, in both solid and inferred variants.
+    ///
+    /// Rebuilt only when the node set, the colour mode or the appearance changes.
+    /// Constructing a SwiftUI `Color` per edge per frame showed up as real cost
+    /// on a graph of a few thousand edges, and the value is identical every time.
+    /// A reference type on purpose: the Canvas draw closure is non-mutating, so
+    /// a value-typed cache could not be filled from inside it.
+    final class EdgeColorCache {
+        var solid: [Color] = []
+        var inferred: [Color] = []
+        var signature: String = ""
+    }
+
+    private func edgeColorCache(dark: Bool) -> EdgeColorCache {
+        let signature = "\(layout.nodes.count)|\(detail.colourBy.rawValue)|\(dark)"
+        let cache = edgeColorStore
+        if cache.signature == signature { return cache }
+
+        var solid: [Color] = []
+        var inferred: [Color] = []
+        solid.reserveCapacity(layout.nodes.count)
+        inferred.reserveCapacity(layout.nodes.count)
+        for node in layout.nodes {
+            let (hue, _) = hueSaturation(for: node)
+            solid.append(GraphPalette.edgeColor(hue: hue, inferred: false, dark: dark))
+            inferred.append(GraphPalette.edgeColor(hue: hue, inferred: true, dark: dark))
+        }
+        cache.solid = solid
+        cache.inferred = inferred
+        cache.signature = signature
+        return cache
     }
 
     private func hueSaturation(for node: GraphNode) -> (Double, Double) {
@@ -716,8 +858,11 @@ struct GraphCanvasView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-                if !namedRelationships(of: node).isEmpty {
-                    Text(namedRelationships(of: node).prefix(3).joined(separator: " · "))
+                // Computed once. This walks every edge in the graph, and the
+                // tooltip's body re-evaluates on every simulation frame.
+                let wiring = namedRelationships(of: node).prefix(3)
+                if !wiring.isEmpty {
+                    Text(wiring.joined(separator: " · "))
                         .font(.caption2)
                         .foregroundStyle(.tint)
                 }
@@ -734,12 +879,18 @@ struct GraphCanvasView: View {
     /// The wiring this node takes part in, beyond plain imports — the reason
     /// most people are looking at it.
     private func namedRelationships(of node: GraphNode) -> [String] {
-        detail.graph.edges.compactMap { edge in
-            guard edge.kind != "import" else { return nil }
-            if edge.from == node.id { return "\(EdgeVocabulary.label(edge.kind)) \(shortName(edge.to))" }
-            if edge.to == node.id { return "\(shortName(edge.from)) \(EdgeVocabulary.label(edge.kind)) this" }
-            return nil
+        var out: [String] = []
+        for edge in detail.graph.edges {
+            guard edge.kind != "import" else { continue }
+            if edge.from == node.id {
+                out.append("\(EdgeVocabulary.label(edge.kind)) \(shortName(edge.to))")
+            } else if edge.to == node.id {
+                out.append("\(shortName(edge.from)) \(EdgeVocabulary.label(edge.kind)) this")
+            }
+            // Only the first three are shown; there is no reason to build the rest.
+            if out.count == 3 { break }
         }
+        return out
     }
 
     private func shortName(_ path: String) -> String {
@@ -827,9 +978,10 @@ struct GraphCanvasView: View {
                 }
 
                 if let index = draggingIndex, index >= 0 {
-                    // Dragging a node in the 3D view moves it on the plane facing
-                    // the viewer, which is the only unambiguous reading of a 2D drag.
-                    layout.pin(index, at: toGraph(value.location))
+                    // `toGraph` inverts the 2D pan and zoom only. Using it in the
+                    // 3D view ignored the rotation and the perspective divide, so
+                    // grabbing a node teleported it out of the cloud.
+                    layout.pin(index, at: graphPoint(from: value.location, forNode: index))
                 } else if layout.mode == .orbit {
                     yaw = dragStartYaw + Double(value.translation.width) * 0.006
                     // Clamped just short of the poles: past vertical the cloud
@@ -845,8 +997,7 @@ struct GraphCanvasView: View {
                 }
             }
             .onEnded { _ in
-                if let index = draggingIndex, index >= 0 { layout.unpin(index) }
-                draggingIndex = nil
+                releaseDrag()
             }
     }
 
@@ -859,17 +1010,47 @@ struct GraphCanvasView: View {
     private func hitTest(at point: CGPoint) -> Int? {
         if layout.mode != .orbit { return layout.hitTest(toGraph(point)) }
 
-        let projected = projectAll()
+        // Hover fires at pointer rate. Building the full projection array here
+        // allocated a new array of every node on every mouse move; this walks the
+        // same maths without allocating and keeps only the best candidate.
+        let count = layout.nodes.count
+        guard count > 0, layout.radius.count >= count, layout.depth.count >= count else { return nil }
+
+        let bounds = layout.cloudBounds()
+        let cameraDistance = bounds.radius * 2.6
+        let cosYaw = cos(yaw), sinYaw = sin(yaw)
+        let cosPitch = cos(pitch), sinPitch = sin(pitch)
+
         var best: Int?
-        var bestDepth = Double.infinity
-        for i in projected.indices {
-            let dx = projected[i].point.x - point.x
-            let dy = projected[i].point.y - point.y
-            let distance = sqrt(dx * dx + dy * dy)
-            guard distance <= projected[i].radius + 5 else { continue }
-            if projected[i].depth < bestDepth {
+        var bestViewZ = Double.infinity
+
+        for i in 0..<count {
+            let x = layout.position[i].x - bounds.centre.x
+            let y = layout.position[i].y - bounds.centre.y
+            let z = layout.depth[i] - bounds.centre.z
+
+            let x1 = x * cosYaw + z * sinYaw
+            let z1 = -x * sinYaw + z * cosYaw
+            let y2 = y * cosPitch - z1 * sinPitch
+            let z2 = y * sinPitch + z1 * cosPitch
+
+            let viewZ = z2 + cameraDistance
+            let k = cameraDistance / max(cameraDistance * 0.25, viewZ)
+
+            let sx = x1 * k * Double(scale) + Double(offset.width)
+            let sy = y2 * k * Double(scale) + Double(offset.height)
+            let r = max(0.6, layout.radius[i] * Double(scale) * k)
+
+            // A hidden node is not on screen; hovering, selecting or dragging one
+            // the legend has filtered out is indistinguishable from a bug.
+            if detail.hiddenLayers.contains(layout.nodes[i].layer) { continue }
+            let dx = sx - Double(point.x)
+            let dy = sy - Double(point.y)
+            guard (dx * dx + dy * dy).squareRoot() <= r + 5 else { continue }
+            // Nearest to the camera wins, which is the one drawn on top.
+            if viewZ < bestViewZ {
                 best = i
-                bestDepth = projected[i].depth
+                bestViewZ = viewZ
             }
         }
         return best
@@ -954,15 +1135,24 @@ private struct ZoomCatcher: NSViewRepresentable {
         nsView.onZoom = onZoom
     }
 
+    /// Watches for scroll and pinch over the canvas without taking part in hit testing.
+    ///
+    /// `hitTest` returns nil so clicks and drags reach the SwiftUI gestures
+    /// underneath — which also takes this view out of the path AppKit uses to
+    /// route scroll and pinch, so the responder overrides below cannot be relied
+    /// on to fire. A local event monitor reads those events before dispatch,
+    /// filtered to the ones landing inside these bounds.
+    ///
+    /// Both paths are kept deliberately. The monitor consumes what it handles,
+    /// so the overrides can never double-apply a zoom; they simply remain as the
+    /// fallback if the monitor is ever not installed.
     final class CatcherView: NSView {
         var onZoom: ((CGFloat, CGPoint) -> Void)?
+        private var monitor: Any?
 
-        // Pass clicks and drags through: this view exists only for the wheel.
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
         override func scrollWheel(with event: NSEvent) {
-            // A plain two-finger scroll zooms; the graph has no scrollable
-            // content of its own, so there is nothing to conflict with.
             let raw = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 220 : event.scrollingDeltaY / 12
             guard raw != 0 else { return }
             emit(factor: 1 + raw, at: event)
@@ -976,8 +1166,44 @@ private struct ZoomCatcher: NSViewRepresentable {
         private func emit(factor: CGFloat, at event: NSEvent) {
             let local = convert(event.locationInWindow, from: nil)
             // AppKit's origin is bottom-left; SwiftUI's is top-left.
-            let flipped = CGPoint(x: local.x, y: bounds.height - local.y)
-            onZoom?(factor, flipped)
+            onZoom?(factor, CGPoint(x: local.x, y: bounds.height - local.y))
         }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else {
+                removeMonitor()
+                return
+            }
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify]) { [weak self] event in
+                guard let self, let window = self.window, event.window === window else { return event }
+                let local = self.convert(event.locationInWindow, from: nil)
+                guard self.bounds.contains(local) else { return event }
+
+                let factor: CGFloat
+                if event.type == .magnify {
+                    guard event.magnification != 0 else { return event }
+                    factor = 1 + event.magnification
+                } else {
+                    let raw = event.hasPreciseScrollingDeltas
+                        ? event.scrollingDeltaY / 220
+                        : event.scrollingDeltaY / 12
+                    guard raw != 0 else { return event }
+                    factor = 1 + raw
+                }
+
+                // AppKit's origin is bottom-left; SwiftUI's is top-left.
+                self.onZoom?(factor, CGPoint(x: local.x, y: self.bounds.height - local.y))
+                return nil // consumed
+            }
+        }
+
+        private func removeMonitor() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        deinit { removeMonitor() }
     }
 }

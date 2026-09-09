@@ -36,11 +36,18 @@ final class EngineClient: ObservableObject {
     private var eventSinks: [Int: (EngineEvent) -> Void] = [:]
     private var stderrTail = ""
     private var intentionalShutdown = false
+    private var restartAttempts = 0
+    private var restartTask: Task<Void, Never>?
+
+    /// Called after the engine has been restarted, so the app can re-push
+    /// credentials and refresh — the new process starts with nothing.
+    var onRestart: (() -> Void)?
 
     // MARK: - Lifecycle
 
     func start() {
         guard process == nil else { return }
+        intentionalShutdown = false
         let resolved: EngineLocation
         do {
             resolved = try EngineLocator.resolve()
@@ -121,11 +128,55 @@ final class EngineClient: ObservableObject {
             startupError = diagnose(code: code)
         }
 
+        // An engine that dies after a good start takes every schedule, watcher and
+        // supervised dev server with it, and nothing brought it back — the app just
+        // stopped working until it was quit and relaunched. Restart it, with a
+        // backoff and a cap so a genuinely broken engine is not respawned forever.
+        if wasReady && !intentionalShutdown {
+            scheduleRestart(after: code)
+        }
+
         let failures = pending.values
         pending.removeAll()
         eventSinks.removeAll()
         for cont in failures {
             cont.resume(throwing: EngineError(message: "The engine exited (code \(code))."))
+        }
+    }
+
+    private func scheduleRestart(after code: Int32) {
+        guard restartAttempts < 5 else {
+            startupError = """
+            The RepoDeck engine has stopped repeatedly and will not be restarted again. \
+            Quit and reopen RepoDeck; if it keeps happening, the last error was:
+
+            \(stderrTail.suffix(400))
+            """
+            return
+        }
+        restartAttempts += 1
+        let delay = UInt64(min(8, 1 << (restartAttempts - 1))) * 1_000_000_000
+
+        restartTask?.cancel()
+        restartTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self, !Task.isCancelled else { return }
+            self.onEvent?(EngineEvent.log(
+                stream: "engine",
+                text: "[RepoDeck] the engine exited (code \(code)); restarting — attempt \(self.restartAttempts)\n"
+            ))
+            self.stderrTail = ""
+            self.start()
+
+            // Give the daemon a moment to announce itself, then hand it back the
+            // credentials and let the app resync.
+            for _ in 0..<60 where !self.isReady {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if self.isReady {
+                self.restartAttempts = 0
+                self.onRestart?()
+            }
         }
     }
 

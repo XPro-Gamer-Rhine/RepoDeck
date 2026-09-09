@@ -48,10 +48,22 @@ function dispatch(methods, line) {
     return;
   }
 
+  // `null`, `42` and `[1,2,3]` are all valid JSON, so they survive the parse and
+  // then blow up on destructuring — outside any handler, which takes the whole
+  // daemon down with them. Three bytes on stdin were enough.
+  if (req === null || typeof req !== "object" || Array.isArray(req)) {
+    emit({ t: "fatal", message: "bad rpc frame: expected a JSON object" });
+    return;
+  }
+
   const { id, method, params } = req;
-  const fn = methods[method];
+
+  // Own properties only. A plain object inherits toString, valueOf and friends
+  // from Object.prototype, and a bare `methods[method]` lookup finds them — so
+  // {"method":"toString"} dispatched and answered ok with "[object Undefined]".
+  const fn = Object.hasOwn(methods, method) ? methods[method] : undefined;
   if (typeof fn !== "function") {
-    write({ id, ok: false, error: `unknown method "${method}"` });
+    write({ id: id ?? null, ok: false, error: `unknown method "${method}"` });
     return;
   }
 

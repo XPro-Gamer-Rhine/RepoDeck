@@ -192,17 +192,62 @@ const ENDPOINTS_SCHEMA = {
   },
 };
 
+/**
+ * Narrow a pass's candidate list to what is worth paying for.
+ *
+ * Two independent problems, one place to solve them.
+ *
+ * On an incremental sync the passes were handed the entire tree, so an hourly
+ * auto-pull re-extracted the whole API surface every hour even when one file
+ * had moved. `changedPaths` cuts that to the files this sync actually touched;
+ * the rows for everything else stay in the database untouched.
+ *
+ * And even a full run needs a ceiling: nothing bounded the number of batches,
+ * so a large repository fanned out into hundreds of calls. Ranking by
+ * connectedness and recency first means the cap keeps the files that carry the
+ * architecture and drops the long tail.
+ */
+function selectCandidates(ctx, pass, candidates, cap) {
+  let selected = candidates;
+
+  const changed = ctx.changedPaths;
+  if (changed && changed.size > 0 && !ctx.full) {
+    const delta = selected.filter((f) => changed.has(f.path));
+    // If nothing this pass cares about changed, there is nothing to re-extract.
+    selected = delta;
+  }
+
+  if (selected.length > cap) {
+    const rank = (f) =>
+      (f.routeLines?.length || 0) * 4 + (f.hints?.length || 0) * 2 + (f.exports?.length || 0);
+    selected = [...selected].sort((a, b) => rank(b) - rank(a)).slice(0, cap);
+    progress("kg", `Capped this pass at ${cap} files — the rest are the long tail`);
+  }
+
+  // Record exactly which files this pass looked at. The save step deletes only
+  // the rows those files own, so a scoped run replaces what it re-derived and
+  // leaves the rest of the graph alone.
+  ctx.processedBy = ctx.processedBy || {};
+  ctx.processedBy[pass] = new Set(selected.map((f) => f.path));
+  return selected;
+}
+
 async function buildEndpoints(cfg, ctx, onProgress) {
   const { scanned, resolvedImports } = ctx;
 
   // Only files that plausibly declare or handle requests. Sending the whole tree
   // through this pass would triple the bill for nothing.
-  const candidates = scanned.filter(
-    (f) =>
-      f.routeLines.length > 0 ||
-      f.hints.includes("declares-routes") ||
-      f.hints.includes("controller-class") ||
-      ["route", "controller"].includes(ctx.layerOf.get(f.path)),
+  const candidates = selectCandidates(
+    ctx,
+    "endpoints",
+    scanned.filter(
+      (f) =>
+        f.routeLines.length > 0 ||
+        f.hints.includes("declares-routes") ||
+        f.hints.includes("controller-class") ||
+        ["route", "controller"].includes(ctx.layerOf.get(f.path)),
+    ),
+    config.limits.kgMaxFilesPerPass,
   );
   if (candidates.length === 0) return [];
 
@@ -250,10 +295,19 @@ return an empty array rather than a guess. Accuracy beats coverage.`,
   );
 
   const out = [];
+  let failed = 0;
   for (const r of results) {
-    if (!r || r.error) continue;
+    if (!r || r.error) {
+      failed++;
+      continue;
+    }
     out.push(...(r.endpoints || []));
   }
+  // A batch that failed produced no rows, and deleting the rows it WOULD have
+  // produced is how a bad afternoon on the API turns into "this repository has
+  // no endpoints" — stated as fact in the exported document. The count travels
+  // with the result so the save step can decline to clear anything.
+  out.failedBatches = failed;
   return out;
 }
 
@@ -296,8 +350,13 @@ const ENTITIES_SCHEMA = {
 };
 
 async function buildEntities(cfg, ctx, onProgress) {
-  const candidates = ctx.scanned.filter(
-    (f) => f.hints.includes("data-model") || ctx.layerOf.get(f.path) === "model",
+  const candidates = selectCandidates(
+    ctx,
+    "entities",
+    ctx.scanned.filter(
+      (f) => f.hints.includes("data-model") || ctx.layerOf.get(f.path) === "model",
+    ),
+    config.limits.kgMaxFilesPerPass,
   );
   if (candidates.length === 0) return [];
 
@@ -334,10 +393,19 @@ Only report what is written in the source. No inferred fields.`,
   );
 
   const out = [];
+  let failed = 0;
   for (const r of results) {
-    if (!r || r.error) continue;
+    if (!r || r.error) {
+      failed++;
+      continue;
+    }
     out.push(...(r.entities || []));
   }
+  // A batch that failed produced no rows, and deleting the rows it WOULD have
+  // produced is how a bad afternoon on the API turns into "this repository has
+  // no entities" — stated as fact in the exported document. The count travels
+  // with the result so the save step can decline to clear anything.
+  out.failedBatches = failed;
   return out;
 }
 
@@ -369,8 +437,13 @@ const SCREENS_SCHEMA = {
 };
 
 async function buildScreens(cfg, ctx, onProgress) {
-  const candidates = ctx.scanned.filter(
-    (f) => ["page", "component"].includes(ctx.layerOf.get(f.path)) || f.hints.includes("page-or-view"),
+  const candidates = selectCandidates(
+    ctx,
+    "screens",
+    ctx.scanned.filter(
+      (f) => ["page", "component"].includes(ctx.layerOf.get(f.path)) || f.hints.includes("page-or-view"),
+    ),
+    config.limits.kgMaxFilesPerPass,
   );
   if (candidates.length === 0) return [];
 
@@ -408,10 +481,19 @@ Skip pure presentational leaf components with no route, no calls and no state.`,
   );
 
   const out = [];
+  let failed = 0;
   for (const r of results) {
-    if (!r || r.error) continue;
+    if (!r || r.error) {
+      failed++;
+      continue;
+    }
     out.push(...(r.screens || []));
   }
+  // A batch that failed produced no rows, and deleting the rows it WOULD have
+  // produced is how a bad afternoon on the API turns into "this repository has
+  // no screens" — stated as fact in the exported document. The count travels
+  // with the result so the save step can decline to clear anything.
+  out.failedBatches = failed;
   return out;
 }
 
@@ -445,9 +527,10 @@ async function buildModuleBriefs(cfg, repoId, onProgress) {
     .prepare(
       `SELECT module, COUNT(*) AS files
        FROM files WHERE repo_id = ? AND deleted = 0 AND module IS NOT NULL AND module != ''
-       GROUP BY module ORDER BY files DESC`,
+       GROUP BY module ORDER BY files DESC
+       LIMIT ?`,
     )
-    .all(repoId);
+    .all(repoId, config.limits.kgMaxModules);
   if (modules.length === 0) return [];
 
   const results = await providers.pool(
@@ -611,7 +694,46 @@ function putDoc(repoId, kind, key, title, body) {
   ).run(repoId, kind, key, title, JSON.stringify(body));
 }
 
-function saveEndpoints(repoId, endpoints) {
+/**
+ * Refuse to replace a populated table with nothing.
+ *
+ * These passes are many model calls, and every one of them can fail. Clearing
+ * the table first meant a bad afternoon on the API turned "we know 40 endpoints"
+ * into "this repository has no endpoints" — stated with total confidence in the
+ * exported document. An empty result is now treated as "learned nothing this
+ * run", not as "there is nothing".
+ */
+/**
+ * Remove the rows a scoped pass is about to replace.
+ *
+ * A full run clears the table: everything is being re-derived. A scoped run has
+ * only looked at the files that changed, so clearing the table would delete the
+ * knowledge for every file it did not read — the exported graph would shrink a
+ * little more with each scheduled sync until only the last change remained.
+ */
+function clearScope(repoId, table, column, scope) {
+  if (!scope) {
+    db.prepare(`DELETE FROM ${table} WHERE repo_id = ?`).run(repoId);
+    return;
+  }
+  if (scope.size === 0) return;
+  const del = db.prepare(`DELETE FROM ${table} WHERE repo_id = ? AND ${column} = ?`);
+  for (const p of scope) del.run(repoId, p);
+}
+
+function wouldEraseKnowledge(repoId, table, incoming) {
+  if (incoming.length > 0) return false;
+  const existing = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE repo_id = ?`).get(repoId).n;
+  if (existing === 0) return false;
+  progress("kg", `Keeping ${existing} known ${table}: this run extracted none`);
+  return true;
+}
+
+function saveEndpoints(repoId, endpoints, scope) {
+  if (!scope && wouldEraseKnowledge(repoId, "endpoints", endpoints)) return;
+  // Some batches failed, so this result is incomplete by construction. Upsert
+  // what came back and delete nothing.
+  if (endpoints.failedBatches > 0) scope = new Set();
   const insert = db.prepare(
     `INSERT INTO endpoints
        (repo_id, method, path, handler_path, handler_symbol, module, auth, middleware,
@@ -627,7 +749,7 @@ function saveEndpoints(repoId, endpoints) {
   const moduleOf = db.prepare(`SELECT module FROM files WHERE repo_id = ? AND path = ?`);
 
   db.transaction(() => {
-    db.prepare(`DELETE FROM endpoints WHERE repo_id = ?`).run(repoId);
+    clearScope(repoId, "endpoints", "handler_path", scope);
     for (const e of endpoints) {
       if (!e.method || !e.path) continue;
       const owner = e.handlerPath ? moduleOf.get(repoId, e.handlerPath) : null;
@@ -657,7 +779,11 @@ function saveEndpoints(repoId, endpoints) {
   })();
 }
 
-function saveEntities(repoId, entities) {
+function saveEntities(repoId, entities, scope) {
+  if (!scope && wouldEraseKnowledge(repoId, "entities", entities)) return;
+  // Some batches failed, so this result is incomplete by construction. Upsert
+  // what came back and delete nothing.
+  if (entities.failedBatches > 0) scope = new Set();
   const insert = db.prepare(
     `INSERT INTO entities (repo_id, name, file_path, store, fields, relations, summary)
      VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -666,7 +792,7 @@ function saveEntities(repoId, entities) {
        relations = excluded.relations, summary = excluded.summary`,
   );
   db.transaction(() => {
-    db.prepare(`DELETE FROM entities WHERE repo_id = ?`).run(repoId);
+    clearScope(repoId, "entities", "file_path", scope);
     for (const e of entities) {
       if (!e.name) continue;
       insert.run(
@@ -682,7 +808,11 @@ function saveEntities(repoId, entities) {
   })();
 }
 
-function saveScreens(repoId, screens) {
+function saveScreens(repoId, screens, scope) {
+  if (!scope && wouldEraseKnowledge(repoId, "screens", screens)) return;
+  // Some batches failed, so this result is incomplete by construction. Upsert
+  // what came back and delete nothing.
+  if (screens.failedBatches > 0) scope = new Set();
   const insert = db.prepare(
     `INSERT INTO screens (repo_id, name, route, file_path, components, calls, summary)
      VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -691,7 +821,7 @@ function saveScreens(repoId, screens) {
        calls = excluded.calls, summary = excluded.summary`,
   );
   db.transaction(() => {
-    db.prepare(`DELETE FROM screens WHERE repo_id = ?`).run(repoId);
+    clearScope(repoId, "screens", "file_path", scope);
     for (const s of screens) {
       if (!s.name) continue;
       insert.run(
@@ -759,6 +889,12 @@ function saveEnvVars(repoId, scanned, manifests) {
  * `ctx` carries the artefacts the index pass already produced — the scan, the
  * resolved imports, the agreed taxonomy — so nothing is recomputed here.
  */
+/** null on a full run (replace everything), the processed paths on a scoped one. */
+function scopeFor(ctx, pass) {
+  if (ctx.full || !ctx.changedPaths) return null;
+  return (ctx.processedBy && ctx.processedBy[pass]) || new Set();
+}
+
 async function buildKnowledgeGraph(repoId, ctx, opts = {}) {
   const cfg = ctx.provider;
   const repo = db.prepare(`SELECT * FROM repos WHERE id = ?`).get(repoId);
@@ -795,19 +931,19 @@ async function buildKnowledgeGraph(repoId, ctx, opts = {}) {
   const endpoints = await buildEndpoints(cfg, passCtx, (done, total) =>
     progress("kg", `API surface: ${done}/${total} batches`),
   );
-  saveEndpoints(repoId, endpoints);
+  saveEndpoints(repoId, endpoints, scopeFor(passCtx, "endpoints"));
 
   progress("kg", "Extracting data models");
   const entities = await buildEntities(cfg, passCtx, (done, total) =>
     progress("kg", `Data models: ${done}/${total} batches`),
   );
-  saveEntities(repoId, entities);
+  saveEntities(repoId, entities, scopeFor(passCtx, "entities"));
 
   progress("kg", "Mapping screens to endpoints");
   const screens = await buildScreens(cfg, passCtx, (done, total) =>
     progress("kg", `Screens: ${done}/${total} batches`),
   );
-  saveScreens(repoId, screens);
+  saveScreens(repoId, screens, scopeFor(passCtx, "screens"));
 
   progress("kg", "Reading environment configuration");
   saveEnvVars(repoId, ctx.scanned, ctx.manifests);
