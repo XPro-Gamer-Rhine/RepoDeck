@@ -185,7 +185,13 @@ API call — for merged pull requests, hourly by default.
 Storage goes through Node's built-in `node:sqlite`. That is deliberate — the
 engine originally used a native module, which meant the app broke whenever the
 machine's Node moved underneath it. There is now nothing to compile and nothing
-to mismatch. `better-sqlite3` remains an optional fallback for older runtimes.
+to mismatch, and the bundle deliberately ships no compiled binaries: one built
+here would work only for this exact Node ABI and CPU, so including it would hand
+everyone else a linker error instead of a message they can act on.
+
+`better-sqlite3` is still accepted if you install it yourself, but 22.5 is the
+supported floor, and RepoDeck picks a Node that meets it rather than the first
+one it finds on the path.
 
 ### Analysis pipeline
 
