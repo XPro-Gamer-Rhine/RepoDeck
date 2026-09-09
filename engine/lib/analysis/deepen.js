@@ -62,8 +62,14 @@ function sliceFunction(dir, filePath, line, allLinesForFile, budget = 3200) {
  * affordable on a large repository.
  */
 async function enrichSymbols(cfg, repoId, dir, opts = {}) {
-  const limit = opts.limit ?? 120;
+  const limit = opts.limit ?? 250;
 
+  // Worth a contract: anything other code reaches (connected), and anything the
+  // module offers to the outside (exported). Type aliases are excluded — a
+  // contract for a type restates the type — and so are tests.
+  //
+  // Resumable: symbols that already have a purpose are skipped unless forced, so
+  // an interrupted run resumes instead of paying for the same functions twice.
   const targets = db
     .prepare(
       `SELECT s.id, s.path, s.name, s.kind, s.line, s.signature, s.params,
@@ -71,13 +77,15 @@ async function enrichSymbols(cfg, repoId, dir, opts = {}) {
        FROM symbols s
        JOIN files f ON f.repo_id = s.repo_id AND f.path = s.path
        WHERE s.repo_id = ? AND s.deleted = 0 AND f.deleted = 0 AND f.layer != 'test'
-         AND (s.in_degree + s.out_degree) > 0
+         AND s.kind NOT IN ('type', 'module')
+         AND ((s.in_degree + s.out_degree) > 0 OR s.exported = 1)
+         AND (? = 1 OR s.purpose IS NULL)
        ORDER BY degree DESC, s.exported DESC
        LIMIT ?`,
     )
-    .all(repoId, limit);
+    .all(repoId, opts.force ? 1 : 0, limit);
 
-  if (targets.length === 0) return { described: 0 };
+  if (targets.length === 0) return { described: 0, remaining: 0 };
 
   // Read each file once, however many of its functions are in the batch.
   const sourceCache = new Map();
@@ -149,7 +157,18 @@ Only state what the source supports. An empty array is a fine answer; an invente
     }
   })();
 
-  return { described };
+  const remaining = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM symbols s
+       JOIN files f ON f.repo_id = s.repo_id AND f.path = s.path
+       WHERE s.repo_id = ? AND s.deleted = 0 AND f.deleted = 0 AND f.layer != 'test'
+         AND s.kind NOT IN ('type', 'module')
+         AND ((s.in_degree + s.out_degree) > 0 OR s.exported = 1)
+         AND s.purpose IS NULL`,
+    )
+    .get(repoId).n;
+
+  return { described, remaining };
 }
 
 // ── failure playbooks ────────────────────────────────────────────────────────

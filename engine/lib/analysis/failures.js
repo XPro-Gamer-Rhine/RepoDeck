@@ -54,9 +54,20 @@ function buildErrorCatalogue(repoId, dir, scanned) {
        evidence = excluded.evidence`,
   );
 
+  // Mark and sweep rather than delete-and-reinsert.
+  //
+  // The catalogue is extracted statically, but each row also carries a
+  // model-written `meaning` that costs a call to produce. Clearing the table
+  // first threw all of those away on every re-index — the rows came back
+  // identical and unexplained. Now a row that still exists keeps what was
+  // written about it, and only rows whose error genuinely disappeared are removed.
+  const seenIds = new Set();
+  const findExisting = db.prepare(
+    `SELECT id FROM error_catalog WHERE repo_id = ? AND path = ? AND line = ? AND label = ?`,
+  );
+
   let found = 0;
   db.transaction(() => {
-    db.prepare(`DELETE FROM error_catalog WHERE repo_id = ?`).run(repoId);
 
     for (const file of scanned) {
       let source;
@@ -90,25 +101,39 @@ function buildErrorCatalogue(repoId, dir, scanned) {
           seen.add(key);
 
           const owner = enclosingSymbol(declared, i + 1);
+          const stored = label.slice(0, 200);
           insert.run(
             repoId,
             rule.kind,
-            label.slice(0, 200),
+            stored,
             file.path,
             i + 1,
             owner ? owner.name : null,
             meta.module || null,
             trimmed.slice(0, 240),
           );
+          const row = findExisting.get(repoId, file.path, i + 1, stored);
+          if (row) seenIds.add(row.id);
           found++;
           break;
         }
       }
     }
+
+    // Sweep: anything not re-found this pass no longer exists in the source.
+    const stale = db
+      .prepare(`SELECT id FROM error_catalog WHERE repo_id = ?`)
+      .all(repoId)
+      .filter((r) => !seenIds.has(r.id));
+    const remove = db.prepare(`DELETE FROM error_catalog WHERE id = ?`);
+    for (const r of stale) remove.run(r.id);
   })();
 
-  emit({ t: "errors_catalogued", repoId, errors: found });
-  return { errors: found };
+  const explained = db
+    .prepare(`SELECT COUNT(*) AS n FROM error_catalog WHERE repo_id = ? AND meaning IS NOT NULL`)
+    .get(repoId).n;
+  emit({ t: "errors_catalogued", repoId, errors: found, explained });
+  return { errors: found, explained };
 }
 
 /**
